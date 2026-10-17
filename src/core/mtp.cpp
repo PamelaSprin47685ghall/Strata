@@ -132,6 +132,9 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 }  // namespace
 
 MtpDrafter::~MtpDrafter() {
+    // the drafter's device (a layer split's last stage): every free below must land on it, not on
+    // whatever device the caller happens to have current
+    const OnDevice on_d_(device_);
     if (cs_) cudaStreamSynchronize(cs_);
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
@@ -482,6 +485,12 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         bool on = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
                   std::strncmp(prop.gcnArchName, "gfx103", 6) == 0;
         if (const char* v = std::getenv("STRATA_MTP_SIDE_STREAM"); v != nullptr && *v != 0) on = std::atoi(v) != 0;
+        // a SLOT drafter never runs the prompt read the quirk above was measured on, and its side_ would be
+        // pure dead weight (branch_on is false on HIP, so nothing ever launches on it): one more HSA queue on
+        // the drafter's GPU for nothing.  With --batch-mtp that is o.batch idle queues on GPU0, the card whose
+        // queue pressure the rank-4 ready-timeout tracked (STRATA_TP5_FFN_R4_GPU=0 runs) - so only the solo
+        // drafter keeps the gfx103x quirk stream.
+        if (shared != nullptr) on = false;
         if (on && cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking) != cudaSuccess) {
             err = "mtp: streams";
             return false;
@@ -1368,6 +1377,20 @@ bool MtpDrafter::prepare_prefill(std::string& err) {
     return true;
 }
 
+bool MtpDrafter::prepare_round(int T, std::string& err) {
+    const OnDevice on_device(device_);
+    if (T < 1 || T > max_t_) { err = "mtp: prepare_round out of range"; return false; }
+    // the graphs a slot's drafts run: the round for every T it can be called with (an admission drafts T = 1,
+    // a window T = 2), and the steps the chain takes (draft() captures them on demand: a step graph is one
+    // row and cheap, and max_drafts_ bounds how far a slot drafter ever goes)
+    for (int t = 1; t <= T; ++t)
+        if (!capture_round(t, coupled_active_, err)) return false;
+    const int steps = (int) std::min<int64_t>(std::min(max_t_ - 1, max_drafts_), st_.max_cells - 1);
+    for (int j = 1; j < steps; ++j)
+        if (!capture_step(j, coupled_active_, err)) return false;
+    return true;
+}
+
 bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err,
                          bool sync) {
 #if defined(STRATA_GPU_METAL)
@@ -1604,6 +1627,13 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 #endif
                 if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
             }
+            // the spin broke on a finished stream, not a landed output: the graph's write never became visible
+            // (the gfx1030 mapped-memory visibility family).  A -1 here fed the next window's embedding gather a
+            // token id of -1 and the corruption surfaced far away - say it where it happened instead.
+            if (((volatile int32_t*) h_out_)[j] < 0 && cudaStreamQuery(cs_) == cudaSuccess) {
+                err = "mtp draft: output " + std::to_string(j) + " never landed (the graph finished without it)";
+                return false;
+            }
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             if (probs) probs[j] = ((volatile float*) h_prob_)[j];
             prefetch_ple(drafts[j]);
@@ -1640,9 +1670,13 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 #endif
                 if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
             }
+            if (((volatile int32_t*) h_out_)[j] < 0 && cudaStreamQuery(cs_) == cudaSuccess)
+                return false;   // as above: finished without the output landing - never feed -1 on
+            return true;
         };
         tl = Clock::now();
-        wait_step(0);
+        const bool ok0 = wait_step(0);
+        if (!ok0) { err = "mtp draft: output 0 never landed (the graph finished without it)"; return false; }
         if (dt) g_dt.wait0_ms += hms(tl);
         drafts[0] = ((volatile int32_t*) h_out_)[0];
         float pj = ((volatile float*) h_prob_)[0];
@@ -1660,7 +1694,10 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             (void) cudaStreamQuery(cs_);
             prefetch_ple(drafts[j - 1]);
             tl = Clock::now();
-            wait_step(j);
+            if (!wait_step(j)) {
+                err = "mtp draft: output " + std::to_string(j) + " never landed (the graph finished without it)";
+                return false;
+            }
             if (dt) g_dt.waitj_ms += hms(tl);
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
@@ -1825,11 +1862,18 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
     for (int t = 0; t < T; ++t)
-        if (cudaMemcpy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
-                       cudaMemcpyDeviceToDevice) != cudaSuccess) {
+        // cs_ is non-blocking, so a plain cudaMemcpy would stage on the legacy default stream, which does
+        // NOT order against it: the round graph launched next on cs_ could read window_R_ before the copy
+        // lands (an admission's draft on a card that also carries the verify graph and the FFN ranks).
+        if (cudaMemcpyAsync((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
+                            cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
             err = "mtp: staging the first residual failed";
             return false;
         }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // and the first draft captures on cs_: it starts idle
+        err = std::string("mtp: staging the first residual failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
     std::vector<int32_t> toks((size_t) T, token);
     return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts);
 }

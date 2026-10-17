@@ -37,12 +37,14 @@ def tokenizer(path):
 class Engine:
     def __init__(self, exe, cfg, batch, extra_env, extra_args):
         args = list(cfg["args"])
-        if len(cfg.get("gpu") or []) > 1:
+        # 06-phase4: --tp5 replaces a layer split (the engine refuses them side by side), so a tp5 config
+        # ("--tp5" in its args) never gains the automatic --layer-split the multi-GPU configs do
+        if len(cfg.get("gpu") or []) > 1 and "--tp5" not in args:
             args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
         if batch:
             args += ["--batch", str(batch)]
         args += extra_args
-        env = dict(os.environ, **extra_env)
+        env = dict(os.environ, **(cfg.get("env") or {}), **extra_env)   # the config's env too (AMD: the GEMM tuning table)
         env["LD_LIBRARY_PATH"] = ":".join(cfg.get("lib_dirs", []) + [env.get("LD_LIBRARY_PATH", "")])
         if os.name == "nt":
             env["PATH"] = os.pathsep.join(cfg.get("lib_dirs", []) + [env.get("PATH", "")])

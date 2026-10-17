@@ -3752,6 +3752,10 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
 bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
                            std::string& err) {
     using namespace strata::kernels;
+    if ((tp5_qsa_ != nullptr && tp5_qsa_->valid()) || (tp5_gdn_ != nullptr && tp5_gdn_->valid())) {
+        err = "verify: batch rows need native per-slot QSA/GDN mixers; disable STRATA_TP5_QSA and STRATA_TP5_GDN";
+        return false;
+    }
     // the row layout: a slot may own a contiguous group of rows (--batch-mtp), also across the stages of a layer split,
     // whose hand-off buffers hold kVerifyMaxT rows (a stage that hands rows on or takes them)
     if (const char* why = batch_rows_error(rows, S, pos, (int) slots_.size(), max_t_, hbase,
@@ -3879,12 +3883,6 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         progress_beat();
         return true;
     }
-    if (tp5_qsa_ != nullptr && tp5_qsa_->valid()) {
-        // 06 §4.2.3: the QSA tier serves the run() window's doorbells; the batch rows
-        // path (STRATA_TP5_QSA with --batch) is not wired - refuse instead of hanging
-        err = "verify: the QSA tier does not run batch rows windows";
-        return false;
-    }
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k;
         const uint32_t want = (uint32_t) (k + 1);
@@ -3901,7 +3899,8 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
                 const cudaError_t q = cudaStreamQuery(cs_);
                 if (q != cudaErrorNotReady && *seq < want) {
                     err = "verify batch: layer " + std::to_string(l) + " never rang (" +
-                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
+                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")" +
+                          released_note(release_gpu_waits(5000));
                     return false;
                 }
             }
@@ -3914,15 +3913,25 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         cur_layer_ = want - 1;
         set_plan_slot(0);
         progress_at("verify batch: the CPU experts of layer", l);
+        if (tp5_ != nullptr) std::atomic_thread_fence(std::memory_order_seq_cst);
         // The recorded graph consumes the helper mask and weighted sum just as
         // the solo graph does. Reset both and supply this layer's routing weights.
         if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
-        if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
+        const bool tp5_layer = tp5_ != nullptr && tp5_->is_tp5_layer(l);
+        if (tp5_layer) {
+            std::string terr;
+            if (!tp5_->run(l, h_x_, h_ids_, h_w_, S, ss_->k, h_ymiss_, terr)) {
+                err = "verify batch tp5: " + terr + released_note(release_gpu_waits(5000));
+                return false;
+            }
+        } else if (pool != nullptr) {
+            pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
+        }
         if (remote_opt_) remote_opt_->end();
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+        if (!tp5_layer && *(volatile uint32_t*) h_flagA_ != want) {        // Only ordinary pool layers consume a plan.
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
@@ -4056,7 +4065,8 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
                 const cudaError_t q = cudaStreamQuery(cs_);
                 if (q != cudaErrorNotReady && *seq < want) {
                     err = "verify batch: layer " + std::to_string(lb_ + b_k_) + " never rang (" +
-                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
+                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")" +
+                          released_note(release_gpu_waits(5000));
                     b_running_ = false;
                     return -1;
                 }
@@ -4071,13 +4081,24 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         const Clock::time_point b = Clock::now();
         cur_layer_ = want - 1;
         set_plan_slot(0);
+        if (tp5_ != nullptr) std::atomic_thread_fence(std::memory_order_seq_cst);
         if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
-        if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
+        const bool tp5_layer = tp5_ != nullptr && tp5_->is_tp5_layer(lb_ + b_k_);
+        if (tp5_layer) {
+            std::string terr;
+            if (!tp5_->run(lb_ + b_k_, h_x_, h_ids_, h_w_, S, ss_->k, h_ymiss_, terr)) {
+                err = "verify batch tp5: " + terr + released_note(release_gpu_waits(5000));
+                b_running_ = false;
+                return -1;
+            }
+        } else if (pool != nullptr) {
+            pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
+        }
         if (remote_opt_) remote_opt_->end();
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+        if (!tp5_layer && *(volatile uint32_t*) h_flagA_ != want) {        // Only ordinary pool layers consume a plan.
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;

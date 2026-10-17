@@ -294,7 +294,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
         }
-        for (int n_tok : {1, 2, 5, 8}) {
+        for (int n_tok : {1, 2, 3, 4, 5, 6, 7, 8}) {
             std::vector<float> x(size_t(n_tok) * H);
             std::vector<int32_t> ids(size_t(n_tok) * kTopK);
             std::vector<float> w(size_t(n_tok) * kTopK);

@@ -2372,7 +2372,6 @@ int main(int argc, char** argv) {
         if (!o.serve) why = "--tp5 needs --serve (the first version is server-only)";
         else if (!o.layer_split.empty()) why = "--tp5 replaces the layer split, it cannot run beside --layer-split";
         else if (o.pipeline_windows > 0) why = "--tp5 has no pipeline windows, it cannot run beside --pipeline-windows";
-        else if (o.batch > 0) why = "--tp5 runs one session, it cannot run beside --batch";
         else if (o.peer_device >= 1) why = "--tp5 uses all five GPUs as ranks, it cannot run beside --peer-device";
         else if (n_dev < 5) why = "--tp5 needs five GPUs (the sharding plan is fixed at five ranks)";
         if (why) {
@@ -2380,7 +2379,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         std::fprintf(stderr, "strata generate: --tp5 is ON: five-rank tensor parallelism, "
-                             "--serve only, single session\n");
+                             "--serve only%s\n", o.batch > 0 ? " (batch slots enabled)" : ", single session");
     }
     bool split_auto = false, split_same = false;
     if (!o.layer_split.empty()) {
@@ -8086,6 +8085,14 @@ int main(int argc, char** argv) {
                                  vram_free_note().c_str());
                     return 1;
                 }
+                // warm the draft graphs at start: a slot's first draft() would otherwise capture its round
+                // graph INSIDE the first batch window (a capture syncs the drafter's stream: every slot stalls
+                // behind it - the r4g1 run's 36 ms first windows).  Records the kernels only, no state touched.
+                if (!slot_mtp[(size_t) b]->prepare_round(2, err)) {
+                    std::fprintf(stderr, "strata serve: batch MTP slot %d: %s%s\n", b, err.c_str(),
+                                 vram_free_note().c_str());
+                    return 1;
+                }
             }
         }
         // each stage's verifier gets its stage's slot sessions
@@ -10192,8 +10199,13 @@ int main(int argc, char** argv) {
                     std::printf("BT %d %d\n", b, (int) y);
                     ++sl.produced;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                    // A slot that stays live runs ANOTHER window whose rows sit at sl.p (+1: the draft row,
+                    // --batch-mtp only), and a row at pos q needs q + 1 <= max_context.  So continuing needs
+                    // sl.p + 3 <= max_context with --batch-mtp (the old plain-batch bound sl.p + 2 let a slot
+                    // live on at max_context - 1 whose draft row then sat at pos max_context: stage_batch
+                    // refuses it, "runs past its context" - a fatal engine error, not a BDONE).
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
-                                    : sl.p + 2 > o.max_context ? "length" : nullptr;
+                                    : sl.p + (batch_mtp ? 3 : 2) > o.max_context ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
@@ -13068,7 +13080,10 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
-                            (int64_t) live.size() == p;
+                            (int64_t) live.size() == p &&
+                            // the first batch window stages rows at p and p + 1 (the draft row, --batch-mtp):
+                            // the draft row needs p + 2 <= max_context, or stage_batch refuses it (fatal)
+                            p + (batch_mtp ? 2 : 1) <= o.max_context;
                 const auto tc0 = Clock::now();
                 if (cont && !copy_to_slot(admit_slot, live, err)) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());

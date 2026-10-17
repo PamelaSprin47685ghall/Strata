@@ -92,6 +92,10 @@ public:
     /// --pipeline-windows: capture the prefill graphs and size its input records for windows of up to max_t rows now,
     /// so a later prefill(sync = false) of a window neither captures nor allocates (both wait for the device).
     bool prepare_prefill(std::string& err);
+    /// --batch-mtp: capture the round graphs for T = 1..T now (the slot windows draft T <= 2 rows), so a slot's
+    /// first draft neither captures nor uploads (a capture syncs the drafter's stream - inside a batch window
+    /// it stalls every slot).  Records the kernels only: no K/V cell is written, no state touched.
+    bool prepare_round(int T, std::string& err);
     cudaStream_t stream() const { return cs_; }
 
     /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
