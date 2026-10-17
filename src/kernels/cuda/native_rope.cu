@@ -73,6 +73,10 @@ __global__ void norm_rope_kernel(const float* x, int in_stride, const float* __r
                                  float freq_scale, float corr_low, float corr_high,
                                  float ext_factor, float mscale, const int* positions,
                                  const int32_t* mtab, RopeTab rt) {
+#if defined(__HIPCC__)
+    // Match standalone apply's rounded rotation terms before its explicit FMAs.
+#pragma clang fp contract(off)
+#endif
     const int tid = threadIdx.x;
     const int row = blockIdx.x;
     const float* in_row = x + size_t(row) * in_stride;
@@ -114,6 +118,13 @@ __global__ void norm_rope_kernel(const float* x, int in_stride, const float* __r
             rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale, pair, c, s);
         }
         float bs = b * s;
+#if defined(__HIPCC__)
+        // AMD apply emits round(a*s) + fma(b,c,...), not round(b*c) + fma(a,s,...).
+        // The two choices differed in rope_parity's second rotated coordinate.
+        const float as = a * s;
+        out_row[pair] = fmaf(a, c, -bs);
+        out_row[pair + half_rot] = fmaf(b, c, as);
+#else
         float bc = b * c;
 #if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
         asm volatile("mov.f32 %0, %1;" : "=f"(bs) : "f"(bs));
@@ -121,6 +132,7 @@ __global__ void norm_rope_kernel(const float* x, int in_stride, const float* __r
 #endif
         out_row[pair] = fmaf(a, c, -bs);
         out_row[pair + half_rot] = fmaf(a, s, bc);
+#endif
     }
 }
 }

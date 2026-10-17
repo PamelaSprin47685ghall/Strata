@@ -750,7 +750,8 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
     check("row_top_prob");
 }
 
-#if !defined(__HIPCC__)   // warp-32 kernels: an AMD card keeps the one-block row_top_prob and sampler_greedy_kernel
+// CUDA warps and HIP's logical 32-lane shuffles use the same reduction tree.
+// HIP dispatch remains opt-in; the default still uses its one-block kernels.
 namespace {
 
 constexpr int kArgMaxBlocks = 128, kArgThreads = 256, kTopBlocks = 8;
@@ -866,10 +867,21 @@ __global__ void row_top_prob_split_kernel(const float* __restrict__ logits, int 
 
 }  // namespace
 
-uint64_t argmax_rows_scratch_bytes(int n_rows) { return (uint64_t) n_rows * sizeof(ArgRow); }
+uint64_t argmax_rows_scratch_bytes(int n_rows) {
+#if defined(__HIPCC__)
+    if (!multi_block_head_ops()) return 0;
+#endif
+    return (uint64_t) n_rows * sizeof(ArgRow);
+}
 
 void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream) {
     if (n_rows <= 0) return;
+#if defined(__HIPCC__)
+    if (!multi_block_head_ops()) {
+        std::fprintf(stderr, "argmax_rows: enable STRATA_MULTI_BLOCK_ARGMAX=1 on HIP\n");
+        std::exit(1);
+    }
+#endif
     const int nb = std::min(kArgMaxBlocks, std::max(1, (n + 4095) / 4096));
     const int per_block = (n + nb - 1) / nb;
     argmax_rows_kernel<<<dim3((unsigned) nb, (unsigned) n_rows), kArgThreads, 0, (cudaStream_t) stream>>>(
@@ -877,27 +889,26 @@ void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t*
     check("argmax_rows");
 }
 
-uint64_t row_top_prob_scratch_bytes(int n_rows) { return (uint64_t) n_rows * sizeof(TopRow); }
+uint64_t row_top_prob_scratch_bytes(int n_rows) {
+#if defined(__HIPCC__)
+    if (!multi_block_head_ops()) return 0;
+#endif
+    return (uint64_t) n_rows * sizeof(TopRow);
+}
 
 void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* scratch,
                         void* stream) {
     if (n_rows <= 0) return;
+#if defined(__HIPCC__)
+    if (!multi_block_head_ops()) {
+        row_top_prob(logits, n_rows, n_vocab, ids, probs, stream);
+        return;
+    }
+#endif
     row_top_prob_split_kernel<<<dim3(kTopBlocks, (unsigned) n_rows), 1024 / kTopBlocks, 0, (cudaStream_t) stream>>>(
         logits, n_vocab, ids, probs, (TopRow*) scratch);
     check("row_top_prob_split");
 }
-#else
-uint64_t argmax_rows_scratch_bytes(int) { return 0; }
-void argmax_rows(const float*, int, int, void*, int32_t*, void*) {
-    std::fprintf(stderr, "argmax_rows: not built for this backend\n");
-    std::exit(1);
-}
-uint64_t row_top_prob_scratch_bytes(int) { return 0; }
-void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void*,
-                        void* stream) {
-    row_top_prob(logits, n_rows, n_vocab, ids, probs, stream);
-}
-#endif
 
 namespace {
 // grid (kNonfiniteBlocks, rows): block b of row t scans [b * per_block, +per_block) and writes its own word.  The
@@ -924,7 +935,11 @@ void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* fla
 
 bool multi_block_head_ops() {
 #if defined(__HIPCC__)
-    return false;
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MULTI_BLOCK_ARGMAX");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
 #else
     static const bool on = [] {
         const char* v = std::getenv("STRATA_MULTI_BLOCK_ARGMAX");
@@ -936,7 +951,7 @@ bool multi_block_head_ops() {
 
 bool argmax_rows_wanted() {
 #if defined(__HIPCC__)
-    return false;
+    return multi_block_head_ops();
 #else
     // sm_80 to sm_89: sample_tokens' greedy pick there is the one-block kernel (sm_90+ has the cluster kernel)
     static const bool want = [] {

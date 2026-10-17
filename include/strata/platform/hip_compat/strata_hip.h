@@ -55,6 +55,11 @@
 #define cudaHostAllocPortable hipHostMallocPortable
 #define cudaHostAllocMapped hipHostMallocMapped
 #define cudaHostAllocWriteCombined hipHostMallocWriteCombined
+#if HIP_VERSION_MAJOR < 7
+#define cudaHostAllocCoherent 0x40000000
+#else
+#define cudaHostAllocCoherent hipHostMallocCoherent
+#endif
 #define cudaHostRegisterDefault hipHostRegisterDefault
 #define cudaHostRegisterPortable hipHostRegisterPortable
 #define cudaHostRegisterMapped hipHostRegisterMapped

@@ -2587,7 +2587,9 @@ def engine_args(cfg: dict) -> list[str]:
             note += " and --vram-reserve-mib 700"
         print(f'[strata] the config has a "vision" section but no --vision in its args: {note} (run setup again with '
               "--vision to write them)", flush=True)
-    if layer_split_of(cfg) and "--layer-split" not in args:
+    # 06-phase4 §4.1: --tp5 replaces the layer split (the engine refuses them side by side),
+    # so a tp5 config never gains the automatic --layer-split
+    if layer_split_of(cfg) and "--layer-split" not in args and "--tp5" not in args:
         args += ["--layer-split", layer_split_value(cfg)]
     # opt-in: an auto split runs on the first card alone when it holds every profiled expert and the KV
     if layer_split_of(cfg) and cfg.get("split_skip_if_fits") and "--split-skip-if-fits" not in args:

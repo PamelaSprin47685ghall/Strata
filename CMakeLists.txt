@@ -298,8 +298,21 @@ add_library(strata_plan INTERFACE)
 target_include_directories(strata_plan INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_plan INTERFACE strata_warnings)
 
+# The TP5 sharding plan's own invariants (tp5-rocm/04-phase1): interval coverage, quant-block
+# alignment refusal, GQA alignment, the GDN qk rule, pack reorder loss, sliced-vs-unsplit FFN
+# numerics.  CPU-only, so it is deliberately OUTSIDE STRATA_BUILD_TESTS (04 §1.3): it must run
+# in the production build config where the plan code will actually be consumed.
+add_executable(tp5_plan_test tests/core/tp5_plan_test.cpp)
+target_link_libraries(tp5_plan_test PRIVATE strata_plan)
+add_test(NAME tp5_plan_test COMMAND tp5_plan_test)
+
 add_executable(strata-plan src/plan/plan_main.cpp)
 target_link_libraries(strata-plan PRIVATE strata_plan)
+
+# TP5 per-rank VRAM ledger (tp5-rocm/04 §1.5a): static arithmetic from the real GGUF tensor
+# table; refuses (exit 1) when the heaviest rank exceeds the card.  CPU-only.
+add_executable(tp5-ledger src/plan/tp5_ledger_main.cpp)
+target_link_libraries(tp5-ledger PRIVATE strata_plan)
 
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
@@ -389,6 +402,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
+                          src/kernels/cuda/tp5_relay.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -487,6 +501,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+    src/core/tp5_ffn.cu
+    src/core/tp5_qsa.cu
+    src/core/tp5_gdn.cu
     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
@@ -675,6 +692,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_test(NAME hip_handoff COMMAND hip_handoff)
       list(APPEND _strata_hip_tests hip_handoff)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/tp5_vram_probe.cpp")
+      # TP5 empty-allocation VRAM probe (tp5-rocm/04 §1.5b): ledger bytes vs real consumption
+      # per card, with a 96-node graph.  Not a performance test.  Skips without 5 devices.
+      add_executable(hip_tp5_vram_probe tests/hip/tp5_vram_probe.cpp)
+      target_link_libraries(hip_tp5_vram_probe PRIVATE strata_kernels strata_hip_runtime)
+      # needs the real GGUF dir (the ledger's bytes); STRATA_TP5_GGUF_DIR points at it,
+      # absent = SKIP (77) - the probe is a measurement, not a unit test
+      add_test(NAME hip_tp5_vram_probe COMMAND hip_tp5_vram_probe)
+      set_tests_properties(hip_tp5_vram_probe PROPERTIES ENVIRONMENT
+                           "STRATA_TP5_GGUF_DIR=/home/kunweiz/Strata-data/models/swift-q2_0;LD_LIBRARY_PATH=/opt/rocm/lib")
+      set_tests_properties(hip_tp5_vram_probe PROPERTIES SKIP_RETURN_CODE 77)
+      list(APPEND _strata_hip_tests hip_tp5_vram_probe)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/mapped_alias.cpp")
       # #325: reports what a hipHostGetDevicePointer alias is on this stack (on Windows: the host pointer, and a
       # D2D copy into it does not land - hip_handoff's timeout there). A diagnosis: exits 0 whenever it ran.
@@ -684,11 +714,79 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       set_tests_properties(hip_mapped_alias PROPERTIES SKIP_RETURN_CODE 77)
       list(APPEND _strata_hip_tests hip_mapped_alias)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/tp5_relay.cpp")
+      # TP5 RELAY probe (tp5-rocm/05-phase2): 5-rank closed loop, oracle, fault matrix, four
+      # broadcast placements, per-stage timing.  Replaces the retired /tmp probes.
+      add_executable(hip_tp5_relay tests/hip/tp5_relay.cpp)
+      target_link_libraries(hip_tp5_relay PRIVATE strata_kernels strata_hip_runtime)
+      # hsa-runtime64 lives in /opt/rocm/lib (a symlinked core dir); link by absolute path so
+      # the probe builds on any layout where /opt/rocm/lib resolves to the runtime's home.
+      target_link_options(hip_tp5_relay PRIVATE -L/opt/rocm/lib -l:libhsa-runtime64.so)
+      # default placement is host: fine is REFUSED on gfx1030 (CPU->GPU invisible), and the
+      # ctest default must pass on this machine, not report a placement refusal
+      add_test(NAME hip_tp5_relay COMMAND hip_tp5_relay --tokens 200)
+      # libamdhip64.so.7 lives in /opt/rocm/lib: without this a bare `ctest -R tp5` in a
+      # fresh shell fails every hip test on "cannot open shared object file" - a
+      # loader error reads as Failed, never SKIP (the 06 acceptance runs exported it by
+      # hand; the property makes the documented command self-contained)
+      set_tests_properties(hip_tp5_relay PROPERTIES SKIP_RETURN_CODE 77
+                           ENVIRONMENT "LD_LIBRARY_PATH=/opt/rocm/lib")
+      list(APPEND _strata_hip_tests hip_tp5_relay)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/tp5_ffn_test.cpp")
+      # The 5-rank partial FFN tier vs unsplit GPU and CPU references. Needs
+      # the real pack (STRATA_TP5_PACK, default pack/full) and five GPUs; absent pack = SKIP.
+      add_executable(hip_tp5_ffn_test tests/hip/tp5_ffn_test.cpp)
+      target_link_libraries(hip_tp5_ffn_test PRIVATE strata_engine)
+      add_test(NAME hip_tp5_ffn_test COMMAND hip_tp5_ffn_test)
+      set(_tp5_ffn_env
+          "STRATA_TP5_PACK=/home/kunweiz/Strata-data/packs/swift-q2_0;STRATA_TP5_GGUF=/home/kunweiz/Strata-data/models/swift-q2_0/Swift-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf;LD_LIBRARY_PATH=/opt/rocm/lib"
+      )
+      set_tests_properties(hip_tp5_ffn_test PROPERTIES ENVIRONMENT "${_tp5_ffn_env};STRATA_TP5_GRAPH=0")
+      add_test(NAME hip_tp5_ffn_graph_test COMMAND hip_tp5_ffn_test)
+      set_tests_properties(hip_tp5_ffn_graph_test PROPERTIES ENVIRONMENT "${_tp5_ffn_env};STRATA_TP5_GRAPH=1")
+      set_tests_properties(hip_tp5_ffn_test hip_tp5_ffn_graph_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+      list(APPEND _strata_hip_tests hip_tp5_ffn_test hip_tp5_ffn_graph_test)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/native_qsa_score.cpp")
       add_executable(hip_native_qsa_score tests/hip/native_qsa_score.cpp)
       target_link_libraries(hip_native_qsa_score PRIVATE strata_kernels strata_hip_runtime)
       add_test(NAME hip_native_qsa_score COMMAND hip_native_qsa_score)
       list(APPEND _strata_hip_tests hip_native_qsa_score)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/tp5_qsa_test.cpp")
+      # 06-phase4 §4.2.3: the QSA tier's numeric gate - the five partials' sum vs
+      # the unsplit layer's own mixer rows, bit for bit.  Needs the real GGUF
+      # (STRATA_TP5_GGUF) and five GPUs; absent either = SKIP.
+      add_executable(hip_tp5_qsa_test tests/hip/tp5_qsa_test.cpp)
+      target_link_libraries(hip_tp5_qsa_test PRIVATE strata_engine)
+      add_test(NAME hip_tp5_qsa_test COMMAND hip_tp5_qsa_test)
+      # the gate reads the fixture (STRATA_TP5_QSA_FIXTURE; write it with
+      # tools/tp5_qsa_fixture.py) - absent fixture = the test's own SKIP
+      set_tests_properties(hip_tp5_qsa_test PROPERTIES ENVIRONMENT
+                           "STRATA_TP5_QSA_FIXTURE=/tmp/tp5_qsa_fixture;LD_LIBRARY_PATH=/opt/rocm/lib")
+      set_tests_properties(hip_tp5_qsa_test PROPERTIES SKIP_RETURN_CODE 77)
+      list(APPEND _strata_hip_tests hip_tp5_qsa_test)
+      add_executable(hip_tp5_gdn_test tests/hip/tp5_gdn_test.cpp)
+      target_link_libraries(hip_tp5_gdn_test PRIVATE strata_engine)
+      add_test(NAME hip_tp5_gdn_test COMMAND hip_tp5_gdn_test)
+      # the gate reads the fixture (STRATA_TP5_GDN_FIXTURE; write it with
+      # tools/tp5_gdn_fixture.py) - absent fixture = the test's own SKIP
+      set_tests_properties(hip_tp5_gdn_test PROPERTIES ENVIRONMENT
+                           "STRATA_TP5_GDN_FIXTURE=/tmp/tp5_gdn_fixture;LD_LIBRARY_PATH=/opt/rocm/lib")
+      set_tests_properties(hip_tp5_gdn_test PROPERTIES SKIP_RETURN_CODE 77)
+      list(APPEND _strata_hip_tests hip_tp5_gdn_test)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/tp5_qsa_attn_test.cpp")
+      # 06-phase4 §4.2.3 step 1: the G-templated batched attention - a TP5 rank's
+      # {n_head 6/4, n_head_kv 1} call must be bit for bit the unsplit {24, 2} call's rows
+      # for those heads (same per-head arithmetic, only the grouping changed)
+      add_executable(hip_tp5_qsa_attn_test tests/hip/tp5_qsa_attn_test.cpp)
+      target_link_libraries(hip_tp5_qsa_attn_test PRIVATE strata_kernels strata_hip_runtime)
+      add_test(NAME hip_tp5_qsa_attn_test COMMAND hip_tp5_qsa_attn_test)
+      set_tests_properties(hip_tp5_qsa_attn_test PROPERTIES SKIP_RETURN_CODE 77
+                           ENVIRONMENT "LD_LIBRARY_PATH=/opt/rocm/lib")
+      list(APPEND _strata_hip_tests hip_tp5_qsa_attn_test)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/prefill_native_batch.cpp")
       add_executable(hip_prefill_native_batch tests/hip/prefill_native_batch.cpp)
@@ -803,16 +901,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                    "were probed) - the iq_parity fixtures and its test are not registered; the fixtures "
                    "need python3 with numpy and the repository's vendored gguf-py")
   endif()
-  if(STRATA_ENABLE_CUDA)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # native_mmvq's multi_exact contract, bitwise: a T-column call against T single-column calls on the same Q8_1
-    # bytes, with the flag off as the negative control (synthetic, GPU, no model; the control assumes 32-lane warps)
+    # bytes, and paired unequal projections against two individual calls (synthetic GPU, no model).
     add_executable(mmvq_multi_parity src/kernels/mmvq_multi_parity.cpp)
     target_include_directories(mmvq_multi_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(mmvq_multi_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME mmvq_multi_parity COMMAND mmvq_multi_parity)
-    if(STRATA_HIP_GFX906)   # the CUDA layout, where the negative control has power (the wave64 one is exact at every T)
-      add_test(NAME mmvq_multi_parity_cuda_layout COMMAND mmvq_multi_parity)
-      set_tests_properties(mmvq_multi_parity_cuda_layout PROPERTIES ENVIRONMENT "STRATA_MMVQ_WAVE=0")
+    if(STRATA_HIP_GFX906)
+      # Pair dispatch deliberately declines the distinct wave64 algorithm; validate its CUDA-layout fallback.
+      set_tests_properties(mmvq_multi_parity PROPERTIES ENVIRONMENT "STRATA_MMVQ_WAVE=0")
     endif()
   endif()
   if(STRATA_ENABLE_CUDA)
@@ -882,12 +980,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(shared_expert_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(shared_expert_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME shared_expert_parity COMMAND shared_expert_parity --selftest)
-  # the split / batched verify-window kernels (from eddoursul's fork), bitwise vs the kernels they replace; CUDA only
-  if(STRATA_ENABLE_CUDA)
+  # the split / batched verify-window kernels, bitwise vs their one-block versions; HIP dispatch is opt-in
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(verify_parity src/kernels/verify_parity.cpp)
     target_include_directories(verify_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(verify_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME verify_parity COMMAND verify_parity --selftest)
+    if(STRATA_ENABLE_HIP OR STRATA_HIP_GFX906)
+      set_tests_properties(verify_parity PROPERTIES ENVIRONMENT "STRATA_MULTI_BLOCK_ARGMAX=1")
+    endif()
   endif()
 
   add_executable(fused_gr_bench src/kernels/fused_gr_bench.cpp)

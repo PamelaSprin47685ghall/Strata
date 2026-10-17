@@ -23,6 +23,9 @@ namespace strata::plan {
 struct Geometry {
     int n_layers = 48;
     int n_qsa_layers = 12; // layers 3, 7, ... 47 - the full-attention ones
+    int qsa_n_head = 24;   // QSA query heads (q -> kv map is `q / (n_head/n_head_kv)`, integer division)
+    int gdn_q_heads = 16;  // GDN qk heads: the kernel's own map is `qh = v_head % h_k` (fused_gdn.cu)
+    int64_t vocab_size = 248320; // output.weight rows; Q5_K blocks of 256 on this axis
     int n_kv_heads = 2;
     int head_dim = 256;
     int kv_group = 64; // INT8 KV is grouped-64: one fp16 scale per 64 elements

@@ -33,6 +33,8 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/tp5_ffn.hpp"
+#include "strata/core/tp5_qsa.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
@@ -668,6 +670,12 @@ struct Options {
     /// when K is not accepted as guessed).  0 = off (the stages take turns).
     /// -1 (not asked for) = 2 on gfx12 (HIP) layer splits of 3 or more stages, else 0; --pipeline-windows N asks for it.
     int pipeline_windows = -1;
+    /// --tp5 (opt-in, --serve only, 06-phase4 §4.1): five-rank tensor parallelism on five
+    /// GPUs.  Mutually exclusive with --layer-split, --pipeline-windows, --batch and
+    /// --peer-device (the engine refuses the combination at startup, it never silently
+    /// ignores one).  OFF by default: no TP5 resource is allocated and no existing path
+    /// changes when the flag is absent.
+    bool tp5 = false;
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
@@ -2131,6 +2139,7 @@ int main(int argc, char** argv) {
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, std::atoi(next("--pipeline-windows"))));
+        else if (a == "--tp5") o.tp5 = true;
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
         else if (a == "--lookup-chain") o.lookup_chain = std::clamp(std::atoi(next("--lookup-chain")), 0, 7);
@@ -2354,6 +2363,25 @@ int main(int argc, char** argv) {
     const bool pcie_given = o.pcie_frac >= 0.0;
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
+    // ---- --tp5 (06-phase4 §4.1): opt-in, --serve only, five GPUs, mutually exclusive ----
+    if (o.tp5) {
+        const char* why = nullptr;
+        int n_dev = 0;
+        if (cudaGetDeviceCount(&n_dev) != cudaSuccess) n_dev = 0;
+        cudaGetLastError();
+        if (!o.serve) why = "--tp5 needs --serve (the first version is server-only)";
+        else if (!o.layer_split.empty()) why = "--tp5 replaces the layer split, it cannot run beside --layer-split";
+        else if (o.pipeline_windows > 0) why = "--tp5 has no pipeline windows, it cannot run beside --pipeline-windows";
+        else if (o.batch > 0) why = "--tp5 runs one session, it cannot run beside --batch";
+        else if (o.peer_device >= 1) why = "--tp5 uses all five GPUs as ranks, it cannot run beside --peer-device";
+        else if (n_dev < 5) why = "--tp5 needs five GPUs (the sharding plan is fixed at five ranks)";
+        if (why) {
+            std::fprintf(stderr, "strata generate: --tp5 is off: %s\n", why);
+            return 2;
+        }
+        std::fprintf(stderr, "strata generate: --tp5 is ON: five-rank tensor parallelism, "
+                             "--serve only, single session\n");
+    }
     bool split_auto = false, split_same = false;
     if (!o.layer_split.empty()) {
         int n_dev = 1;
@@ -7938,6 +7966,95 @@ int main(int argc, char** argv) {
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
         }
         ver.set_remote_expert_opt(remote_opt.get());
+        // ---- 06-phase4 §4.2.1-4.2.2: the TP5 FFN TIER (opt-in, --tp5).  The tier holds
+        // the routed experts of STRATA_TP5_LAYERS layers (default: ALL 48) split five ways
+        // (a 1/5 slice per rank), computes partials with the engine's own grouped kernel,
+        // reduces with the router weights on each rank, and sums through the RELAY.
+        // The graph adds only its shared expert. GPU0 keeps the verify graph; the ranks
+        // run on GPUs 1-4 (rank 4 shares GPU1).
+        strata::core::Tp5FfnTier tp5_tier;
+        strata::core::Tp5QsaTier tp5_qsa_tier;
+        strata::core::Tp5GdnTier tp5_gdn_tier;
+        if (o.tp5) {
+            int tp5_nlayers = (int) g.n_layers;
+            if (const char* v = std::getenv("STRATA_TP5_LAYERS")) tp5_nlayers = std::atoi(v);
+            if (tp5_nlayers <= 0 || tp5_nlayers > (int) g.n_layers) {
+                std::fprintf(stderr, "strata serve: STRATA_TP5_LAYERS %d is outside 1..%lld\n",
+                             tp5_nlayers, (long long) g.n_layers);
+                return 1;
+            }
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            int64_t span = 0;
+            for (int64_t l = 0; l < tp5_nlayers; ++l) span += int64_t(lay.blob_bytes(l)) * g.n_expert;
+            std::vector<uint8_t> blobs(size_t(span), 0);
+            {
+                const uint8_t* src = srcp->blob_stable(0, 0);
+                // the layers' blobs are layer-major in the source; copy layer by layer
+                const uint8_t* cur = nullptr;
+                size_t off = 0;
+                for (int64_t l = 0; l < tp5_nlayers; ++l) {
+                    const int64_t bb = int64_t(lay.blob_bytes(l));
+                    for (int64_t e = 0; e < g.n_expert; ++e) {
+                        cur = srcp->blob_stable(l, e);
+                        if (cur == nullptr) {
+                            std::fprintf(stderr, "strata serve: --tp5: the expert source has no "
+                                         "blob for layer %lld expert %lld\n", (long long) l,
+                                         (long long) e);
+                            return 1;
+                        }
+                        std::memcpy(blobs.data() + off, cur, size_t(bb));
+                        off += size_t(bb);
+                    }
+                }
+                (void) src;
+            }
+            std::string terr;
+            if (!tp5_tier.open(tp5_nlayers, blobs.data(), g.n_expert, terr)) {
+                std::fprintf(stderr, "strata serve: --tp5: %s\n", terr.c_str());
+                return 1;
+            }
+            ver.set_tp5(&tp5_tier);
+            std::fprintf(stderr, "strata serve: --tp5: %d layer%s on the five-rank partial "
+                         "tier (%.2f GiB VRAM across the ranks)\n",
+                         tp5_nlayers, tp5_nlayers == 1 ? "" : "s",
+                         double(tp5_tier.vram_bytes()) / 1073741824.0);
+            // 06 §4.2.3: the QSA tier (opt-in STRATA_TP5_QSA=1 while the engine wiring is
+            // young; the FFN tier above is the default --tp5 path)
+            if (const char* v = std::getenv("STRATA_TP5_QSA"); v != nullptr && std::atoi(v) != 0) {
+                if (o.native_dense_gguf.empty()) {
+                    std::fprintf(stderr, "strata serve: --tp5 qsa: needs --native-dense-gguf "
+                                 "(the QSA projections' shard)\n");
+                    return 1;
+                }
+                std::string qerr;
+                if (!tp5_qsa_tier.open(strata::gguf_split_paths(o.native_dense_gguf.front()), g.n_embd, qerr)) {
+                    std::fprintf(stderr, "strata serve: --tp5 qsa: %s\n", qerr.c_str());
+                    return 1;
+                }
+                ver.set_tp5_qsa(&tp5_qsa_tier);
+                std::fprintf(stderr, "strata serve: --tp5: the 12 QSA layers on the five-rank "
+                             "mixer tier (%.2f GiB VRAM across the ranks)\n",
+                             double(tp5_qsa_tier.vram_bytes()) / 1073741824.0);
+            }
+            // 06 §4.2.3: the GDN tier (opt-in STRATA_TP5_GDN=1): the 36 GDN layers'
+            // mixer on the five-rank tier, the V-head table [10,10,10,10,8]
+            if (const char* v = std::getenv("STRATA_TP5_GDN"); v != nullptr && std::atoi(v) != 0) {
+                if (o.native_dense_gguf.empty()) {
+                    std::fprintf(stderr, "strata serve: --tp5 gdn: needs --native-dense-gguf "
+                                 "(the GDN projections' shard)\n");
+                    return 1;
+                }
+                std::string gerr;
+                if (!tp5_gdn_tier.open(strata::gguf_split_paths(o.native_dense_gguf.front()), g.n_embd, gerr)) {
+                    std::fprintf(stderr, "strata serve: --tp5 gdn: %s\n", gerr.c_str());
+                    return 1;
+                }
+                ver.set_tp5_gdn(&tp5_gdn_tier);
+                std::fprintf(stderr, "strata serve: --tp5: the 36 GDN layers on the five-rank "
+                             "mixer tier (%.2f GiB VRAM across the ranks, V heads [10,10,10,10,8])\n",
+                             double(tp5_gdn_tier.vram_bytes()) / 1073741824.0);
+            }
+        }
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
@@ -11578,7 +11695,9 @@ int main(int argc, char** argv) {
                 }();
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
                 const int64_t piece = strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C, yield_chunks);
-                if (piece <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                if (piece <= 0) {
+                    if (!sp.run(ids.data() + a0, b0 - a0, a0, e)) return false;
+                } else
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + piece);
                     const auto tq = Clock::now();
@@ -11841,6 +11960,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: --prefill-head-alias: output head restored in %.1f ms before decode\n",
                              std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
             }
+            // 06 §4.2.3: the whole prompt read (EVERY cut) advanced the engine's GDN
+            // state; the tier syncs ONCE, after the LAST cut.  Arming inside the
+            // cuts loop made the sync fire mid-read (the first decode window ran the
+            // tier on a state 6 tokens stale - the garbage that surfaced as EOS at
+            // token 1).
+            if (!cancelled) ver.arm_gdn_sync();
             tr("prompt done (slots refilled)");
             if (il_parts > 0)
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "

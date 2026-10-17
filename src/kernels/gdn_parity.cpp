@@ -20,6 +20,7 @@
 // filled with a value that encodes its own coordinates.
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/fused_gdn.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -510,6 +511,35 @@ int main(int argc, char** argv) {
                                 std::memcmp(st.data(), (c.n_keep < 0 ? st0 : sr).data(), st.size() * 4) != 0 ? ", state too" : "");
                     ++sn_bad;
                 }
+            }
+            if (T == 1) {
+                // A self-committing QFUSE window must produce the same output/image
+                // as the read-only QFUSE forward and the same state as its later
+                // commit. The former one-token host shortcut skipped that state.
+                const size_t qb = strata::kernels::native_q8_1_bytes(vd, 1);
+                auto d_q = (uint8_t*) dev(qb), d_qr = (uint8_t*) dev(qb);
+                const int32_t keep = 1;
+                check(cudaMemcpy(d_nk, &keep, 4, cudaMemcpyHostToDevice), "self keep");
+                check(cudaMemcpy(d_st, st0.data(), st0.size() * 4, cudaMemcpyHostToDevice), "self state");
+                check(cudaMemcpy(d_sr, st0.data(), st0.size() * 4, cudaMemcpyHostToDevice), "two-phase state");
+                strata::kernels::gdn_step_norm_multi(d_st, d_h, C, d_gate, d_beta, d_z, d_gm, eps, d_y,
+                                                     h_k, h_v, 1, d_nk, nullptr, 0, d_q);
+                strata::kernels::gdn_step_norm_multi(d_sr, d_h, C, d_gate, d_beta, d_z, d_gm, eps, d_yr,
+                                                     h_k, h_v, 1, nullptr, nullptr, 0, d_qr);
+                strata::kernels::gdn_step_norm_multi(d_sr, d_h, C, d_gate, d_beta, d_z, d_gm, eps, d_yr,
+                                                     h_k, h_v, 1, d_nk, nullptr, 1);
+                down(y, d_y); down(yr, d_yr); down(st, d_st); down(sr, d_sr);
+                std::vector<uint8_t> q(qb), qr(qb);
+                check(cudaMemcpy(q.data(), d_q, qb, cudaMemcpyDeviceToHost), "self q8 image");
+                check(cudaMemcpy(qr.data(), d_qr, qb, cudaMemcpyDeviceToHost), "two-phase q8 image");
+                const bool ok = std::memcmp(y.data(), yr.data(), y.size() * 4) == 0 &&
+                                std::memcmp(st.data(), sr.data(), st.size() * 4) == 0 && q == qr;
+                ++sn_n;
+                if (!ok) {
+                    std::printf("    *** QFUSE T=1 self-commit output, q8 image or final state differs from two phases ***\n");
+                    ++sn_bad;
+                }
+                cudaFree(d_q); cudaFree(d_qr);
             }
             cudaFree(d_h); cudaFree(d_gate); cudaFree(d_beta); cudaFree(d_z); cudaFree(d_y); cudaFree(d_yr); cudaFree(d_st);
             cudaFree(d_sr); cudaFree(d_nk);

@@ -303,7 +303,12 @@ class WhatARefusalDoesToTheCaller(unittest.TestCase):
 
     def get_prebuilt(self, updating, digest):
         out = io.StringIO()
-        with contextlib_redirect(out),                 mock.patch.object(setup, "download", self.fake_download),                 mock.patch.object(setup, "engine_digest", return_value=digest):
+        fake_resp = mock.MagicMock()
+        fake_resp.close = mock.MagicMock()
+        with contextlib_redirect(out), \
+             mock.patch.object(setup.urllib.request, "urlopen", return_value=fake_resp), \
+             mock.patch.object(setup, "download", self.fake_download), \
+             mock.patch.object(setup, "engine_digest", return_value=digest):
             return setup.get_prebuilt(setup.PREBUILT_URL, {"arch": 89}, "gpu", updating=updating), out
 
     def test_updating_keeps_the_installed_engine_instead_of_stopping(self):
@@ -323,7 +328,11 @@ class WhatARefusalDoesToTheCaller(unittest.TestCase):
         self.assertIsNone(eng, "a refusal must not escape get_prebuilt as SystemExit")
 
     def test_a_first_install_stops_because_there_is_nothing_to_fall_back_to(self):
-        with mock.patch.object(setup, "download", self.fake_download),                 mock.patch.object(setup, "engine_digest", return_value=(999, "f" * 64)):
+        fake_resp = mock.MagicMock()
+        fake_resp.close = mock.MagicMock()
+        with mock.patch.object(setup.urllib.request, "urlopen", return_value=fake_resp), \
+             mock.patch.object(setup, "download", self.fake_download), \
+             mock.patch.object(setup, "engine_digest", return_value=(999, "f" * 64)):
             with self.assertRaises(SystemExit):
                 setup.get_prebuilt(setup.PREBUILT_URL, {"arch": 89}, "gpu")
 

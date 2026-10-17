@@ -1499,14 +1499,35 @@ __device__ __forceinline__ void row_dot_sub8(const uint8_t* row, const block_q8_
     else row_dot_40_sub8<TD, NC, EXACT_N>(row, x, off, n, t, s);
 }
 
+// A TP5 Q2_0 down row has two 64-value blocks: only four lanes of the
+// ordinary 32-lane dot do work. Pack eight independent rows into each warp,
+// retaining the same four terms and the final xor-2/xor-1 reduction order.
+__global__ void __launch_bounds__(256)
+    native_down_q2_128_kernel(const unsigned long long *__restrict__ grp_ptr, const int32_t *__restrict__ grp_start,
+                              const int32_t *__restrict__ n_groups, const int32_t *__restrict__ ent_dst,
+                              const block_q8_1 *__restrict__ hq, NativeExpertLayout L, float *__restrict__ out) {
+    const int lane = threadIdx.x & 3;
+    const int row = blockIdx.x * 64 + (threadIdx.x >> 2);
+    if (row >= L.n_embd) return;
+    const size_t off = L.down_off + size_t(row) * L.d_row;
+    const int ng = *n_groups;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t *wr = reinterpret_cast<const uint8_t *>(grp_ptr[g]) + off;
+        for (int e = grp_start[g]; e < grp_start[g + 1]; ++e) {
+            float v = 0.0f + Fmt<42>::dot(wr, hq + size_t(e) * 4 + (lane >> 1) * 2, lane >> 1, lane & 1);
+            v += __shfl_xor_sync(0xffffffffu, v, 2, 4);
+            v += __shfl_xor_sync(0xffffffffu, v, 1, 4);
+            if (lane == 0) out[size_t(ent_dst[e]) * L.n_embd + row] = v;
+        }
+    }
+}
+
 // native_down_kernel with the entries taken GRP_NC at a time
-template<int TD, bool SUB_DOWN = true>
-__global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                                const int32_t* __restrict__ grp_start,
-                                                                const int32_t* __restrict__ n_groups,
-                                                                const int32_t* __restrict__ ent_dst,
-                                                                const block_q8_1* __restrict__ hq, NativeExpertLayout L,
-                                                                float* __restrict__ out) {
+template <int TD, bool SUB_DOWN = true>
+__global__ void __launch_bounds__(256)
+    native_down_multi_kernel(const unsigned long long *__restrict__ grp_ptr, const int32_t *__restrict__ grp_start,
+                             const int32_t *__restrict__ n_groups, const int32_t *__restrict__ ent_dst,
+                             const block_q8_1 *__restrict__ hq, NativeExpertLayout L, float *__restrict__ out) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
     __shared__ uint32_t s_hq_buf[GRP_NC * 20 * 9];
@@ -2864,7 +2885,15 @@ template<int TD>
 void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
                  float* out) {
-    if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    if constexpr (TD == 42) {
+        if (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 128 && L.n_embd == 2560) {
+            const dim3 sub_grid(unsigned((L.n_embd + 63) / 64), grid.y);
+            native_down_q2_128_kernel<<<sub_grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            return;
+        }
+    }
+    if constexpr (!kSplit<TD>)
+        native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_old_kernels) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_no_sub16_gu) native_down_multi_kernel<TD, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else native_down_multi_kernel<TD, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);

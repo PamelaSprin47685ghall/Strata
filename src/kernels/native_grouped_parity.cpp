@@ -298,6 +298,33 @@ float median(std::vector<float> v) {
 // per gate/up call within one run), and whichever variant ran before the step would look faster.
 constexpr int kWarmPairs = 20, kPairs = 40;
 
+void bench_tp5(cudaStream_t s, std::mt19937& rng) {
+    std::printf("\nTP5 Q2_0 2560 x 128, current flags: 48 distinct layers, median us/call\n");
+    cudaEvent_t e0, e1;
+    ck(cudaEventCreate(&e0), "event");
+    ck(cudaEventCreate(&e1), "event");
+    for (int tokens : {1, 2, 5, 8}) {
+        for (bool reuse : {false, true}) {
+            if (tokens == 1 && reuse) continue;
+            Setup S(42, 42, 2560, 128, tokens, 10, 32, rng, s);
+            const std::vector<int> sizes(reuse ? 10 : tokens * 10, reuse ? tokens : 1);
+            const int ng = S.plan_sizes(sizes, 0, rng);
+            const Layers layers(S, ng);
+            const auto graph = make_graph(s, S, layers, false, 0);
+            std::vector<float> times;
+            for (int i = 0; i < kWarmPairs + kPairs; ++i) {
+                const float us = launch_us(s, graph, e0, e1);
+                if (i >= kWarmPairs) times.push_back(us);
+            }
+            ck(cudaGraphExecDestroy(graph), "graph");
+            std::printf("  T=%d, %2d groups, %s: %.2f us\n", tokens, ng,
+                        reuse ? "cross-token expert reuse" : "distinct experts", median(times));
+        }
+    }
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+}
+
 void bench(cudaStream_t s, std::mt19937& rng) {
     std::printf("\n--bench: microseconds per call, a window's 48 calls in a graph, each layer with its own experts (the\n"
                 "weights stream from DRAM as in the engine); v1 / new (grid_groups): medians of %d launches each,\n"
@@ -349,7 +376,11 @@ int main(int argc, char** argv) {
         for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS; IQ4_XS: n_ff % 256
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(21, 23, 2560, 768, s, rng);
-    if (do_bench) bench(s, rng);
+    check(42, 42, 2560, 128, s, rng);                                  // TP5: empty groups and strided subwarp grids
+    if (do_bench) {
+        bench(s, rng);
+        bench_tp5(s, rng);
+    }
     std::printf("native_grouped_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);
     return g_fail ? 1 : 0;

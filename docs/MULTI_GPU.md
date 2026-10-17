@@ -351,3 +351,85 @@ These are opt-in settings on one rig, not defaults.
 
 With a layer split, `--batch N --batch-groups G --trim-stage-weights` decodes several conversations together and
 pipelines them through the cards: see [BATCHING.md](BATCHING.md).
+
+## Tensor parallel on five GPUs (`--tp5`, off unless you ask)
+
+`--tp5` is a separate opt-in for five GPUs. It splits each layer across the five cards (tensor parallel), instead of
+giving each card a range of layers. It is **off by default**. With the flag absent, no TP5 buffer is allocated and the
+layer-split path is unchanged.
+
+It cannot run beside `--layer-split`, `--pipeline-windows`, `--batch`, or `--peer-device`. Passing one of those with
+`--tp5` is a startup error, not a silent ignore. The first version is `--serve` only, one session, and needs five GPUs.
+
+On this machine the switch is in `strata-swift-q2_0-fullvram-tp5.json` (`--tp5`, `--ple-io mmap`). The five-rank FFN
+path is the default under that flag. The QSA and GDN mixers stay off unless `STRATA_TP5_QSA=1` or `STRATA_TP5_GDN=1`.
+Do not treat the speeds in `TP5-ROCM.md` as a default, and do not turn `--tp5` on from setup.
+
+The later 2026-10-16 FFN rewrite changes that data flow: each rank reduces all ten routed experts with
+their router weights before RELAY, so it sends one row per token instead of ten. The CPU still sums
+all five ranks, in rank order, and the verifier adds the already-gated shared expert once. This changes
+FP32 summation order and can change greedy text; it does not omit experts. The current contract is in
+[the engine notes](../tp5-rocm/06-phase4-engine.md), and workload-specific measurements and the local
+launch preset are in [the RX6800 tuning notes](../TUNING-5xRX6800.md).
+
+`STRATA_TP5_FFN_R4_GPU=0` can put the fifth FFN rank on GPU0 when there is enough VRAM. Native HIP
+uses an all-unit CU-mask stream to obtain an independent hardware queue: an ordinary stream could
+alias the verifier's queue and deadlock. It is not a reserved CU slice. The measured local preset caps
+the expert cache at 2600 slots to leave room; do not apply that cache size to other machines without
+checking prefill and context headroom. The engine's default rank-4 placement remains GPU1.
+
+The earlier 383 us/layer decomposition (84 us kernels, 15 us for seven H2D nodes, about 65 us publish/replay,
+119 us dual-rank contention) describes the old unweighted relay on four expert cards. It is not a floor
+for the new path. The old 2.7 GB/s peer-weight-read result remains a negative result for that experiment.
+
+The QSA mixer (`STRATA_TP5_QSA=1`) is a measured slowdown on the 2026-10-16 binary: the same
+280-token answer runs 9,330 vs 8,503 ms with the GDN+graph path on (per token +19.5%; the tier's
+own greedy text differs from the engine path as documented). Its 12 layers add ~7 ms per window of
+GPU-reach wait. Leave it off for speed.
+
+The GDN mixer is close to cost-neutral after the 2026-10-16 state-sync fix: on the measured
+machine the same 280-token answer runs 1.19x slower (9,054 ms with `STRATA_TP5_GDN=1` vs
+7,622 ms without, same text bitwise, same binary). The first measurement showed 2.32x
+(17,689 ms); that was the per-request state sync doing 180 full-device syncs and 23k tiny
+copies, not the tier - `sync_state_span` batches it to one drain and one H2D per (layer,
+rank). Leave it off unless you are testing it; the remaining 1.19x is the tier's per-layer
+relay round trip.
+
+`STRATA_TP5_GDN_GRAPH=1` (opt-in, off by default) captures the GDN tier's per-layer chain into
+hipGraphs, one per (layer, window size, rank) - 900 small graphs at startup, a few extra seconds
+of load time. It is bitwise identical to the eager path (fixture-gated). Two measurements, both
+correct for their binary: on the pre-sync-fix binary (52+ ms per GDN window) it saved nothing
+(0.4%, noise - launch overhead was ~1 ms of a 52 ms window); after the 2026-10-16 state-sync and
+commit-span fixes shrank the window to ~50 ms, the same A/B measured 5.0% end-to-end (8,985 vs
+8,534 ms, non-overlapping ranges, same text bitwise). The graph only ever removes launch
+overhead; turn it on together with `STRATA_TP5_GDN=1` when every millisecond matters. One HIP
+quirk to know: a graph run can leave a sticky "invalid argument" in the launching thread's error
+state with every call succeeding; the tier consumes it in its relay tail and teardown so it
+cannot surface in an unrelated kernel launch.
+
+The recommended GDN+graph combination held a one-hour mixed-request soak on 2026-10-16: 1,537
+requests (ten prompts rotating, 64-token answers), zero errors or RELAY timeouts, acceptance
+0.765, and a flat per-request decode mean over the hour (1,654 vs 1,672 ms for the first and last
+hundred). The same soak on the pre-fix binary had run 5.71 wall tok/s; this one 27.33.
+The GDN-off fastest path passed the same ten-question gate on 2026-10-16: eight of ten answers
+bitwise-equal to the GDN=1 gate run (the two differing ones are the same open-ended prompts that
+also differ from the pipeline baseline — not degeneration), pooled acceptance 0.774, and the
+question-0 code answer runs (exit 0). With speculative decoding off (`--suffix-draft 0`, no
+`--mtp`) the same answers are bitwise-identical and windows run a flat 30.2 ms (1 row/window);
+MTP is worth 1.60x on the code prompt on this machine.
+The GDN-off path also held the same one-hour soak on 2026-10-16: 1,749 requests, zero errors or
+RELAY timeouts, acceptance 0.766, 31.11 wall tok/s (13.8% faster than the GDN+graph soak, matching
+the per-request 1.12x), and no per-request drift over the hour (first/last 100: 2,118 vs 2,062 ms).
+
+`STRATA_TP5_TRACE=1` (measurement only, never for speed) adds a GPU timestamp before and after every rank's
+producer chain and prints, per verify window and per tier, each rank's producer span and which rank was the
+slowest, plus the consumer-side fields the same decomposition needs: the exposed ready-wait per run
+(the host clock's first-seen stamp of every rank's ready flag, and the wait's exit) and the straggler
+skew. The stamps and their readback cost a few percent of decode, so the flag is for the §5.3
+decomposition in `TP5-ROCM.md`, not for benchmark runs.
+
+`STRATA_TP5_GRAPH=1` captures a graph per rank and token-count bucket, replayed for each FFN layer with
+fresh inputs and metadata (the eager path stays the default). `STRATA_TP5_LAUNCH_COUNT=1` (measurement only) tallies the
+per-rank `cudaGraphLaunch` calls and prints them per verify window - the launch-count proof the
+acceptance list in `TP5-ROCM.md` needs. On this machine it counts 48 launches per rank per window
+(one replay per FFN layer), not one per token: it is not a whole-window graph.

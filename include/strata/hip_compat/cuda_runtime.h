@@ -73,6 +73,11 @@
 #define cudaHostAllocPortable hipHostAllocPortable
 #endif
 #define cudaHostGetDevicePointer hipHostGetDevicePointer
+#if HIP_VERSION_MAJOR < 7
+#define cudaHostAllocCoherent 0x40000000
+#else
+#define cudaHostAllocCoherent hipHostMallocCoherent
+#endif
 #define cudaHostRegister hipHostRegister
 #define cudaHostRegisterMapped hipHostRegisterMapped
 #define cudaHostRegisterPortable hipHostRegisterPortable

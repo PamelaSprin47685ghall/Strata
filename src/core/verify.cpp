@@ -198,6 +198,9 @@ const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
 const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
 #endif
 const bool g_trace = env_on("STRATA_VERIFY_TRACE");
+const bool g_tp5_dbg = env_on("STRATA_TP5_FFN_DEBUG");   // 06 §5.3: the tier's cost split
+const bool g_tp5_trace_on = env_on("STRATA_TP5_TRACE");  // 06 §5.3: per-rank producer GPU spans
+const bool g_tp5_launch_count = env_on("STRATA_TP5_LAUNCH_COUNT");  // 06 §6.3: launch proof
 const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
 const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
 
@@ -393,10 +396,13 @@ const int64_t g_test_stall = [] {
 bool Verifier::release_gpu_waits(int timeout_ms) {
     released_.store(true);
     trace_ev("RELEASE", -1, -1, timeout_ms);
+    // 06 §6.4: the engine is giving up on this window's state (a timed-out window,
+    // a watchdog release): the tier's own advance of it is abandoned with it - a
+    // fresh sync (arm_gdn_sync / the next request's seed) rewrites the tier.
     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
     // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
-    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
+    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, h_flagQ_, h_flagG_})
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
@@ -530,7 +536,8 @@ Verifier::~Verifier() {
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, h_qx_, h_qout_, h_flagQ_, h_seqQ_,
+                     h_gx_, h_gout_, h_flagG_, h_seqG_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -641,7 +648,19 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
-              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
+              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_) &&
+              // 06 §4.2.3: the QSA doorbell's words (x rows out to the tier, y rows back, the flag)
+              (tp5_qsa_ == nullptr ||
+               (mapped(T * N * 4, (void**) &h_qx_, (void**) &m_qx_) &&
+                mapped(T * N * 4, (void**) &h_qout_, (void**) &m_qout_) &&
+                mapped(64, (void**) &h_flagQ_, (void**) &m_flagQ_) &&
+                mapped(64, (void**) &h_seqQ_, (void**) &m_seqQ_))) &&
+              (tp5_gdn_ == nullptr ||
+               (mapped(T * N * 4, (void**) &h_gx_, (void**) &m_gx_) &&
+                mapped(T * (int64_t) 6144 * 4, (void**) &h_gout_, (void**) &m_gout_) &&
+                mapped(64, (void**) &h_flagG_, (void**) &m_flagG_) &&
+                mapped(64, (void**) &h_gmode_, (void**) &m_gmode_) &&
+                mapped(64, (void**) &h_seqG_, (void**) &m_seqG_)));
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
@@ -813,6 +832,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             all_resident_ = all_ok;
         }
     }
+    // TP5's weighted routed rows arrive through h_ymiss_. The zero-doorbell graph
+    // computes full local experts and never reads those rows: retain the tier's
+    // doorbells even when every expert is resident in the ordinary cache.
+    if (tp5_ != nullptr) all_resident_ = false;
     // E-6: a layer whose routed experts are all resident is planned on the device (STRATA_VERIFY_DEVICE_PLAN=1: on;
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)
     {
@@ -876,7 +899,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
     // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
-    const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
+    // The QFUSE recurrence accepts the same n_keep pointer and writes the kept
+    // state too; capture and the host skip predicate must agree for both modes.
+    const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
@@ -960,6 +985,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
     }
 
+    // 06 §4.2.3: with the QSA tier on, the captured QSA segments are doorbells
+    const bool qsa_tier_on = tp5_qsa_ != nullptr && tp5_qsa_->valid();
     // per-layer state indices (GDN and QSA layers are numbered separately)
     std::vector<int64_t> gdn_idx((size_t) g.n_layers, -1), qsa_idx((size_t) g.n_layers, -1);
     {
@@ -1006,7 +1033,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             static const bool ple_batch = [] { const char* e = std::getenv("STRATA_PLE_BATCH"); return e && e[0] == '1'; }();
             PleWeights pw = ss.ple.w;
             const bool nkey = pw.key_native_data != nullptr && pw.key_bf16 == nullptr;
-            const bool batched = !ple_batch_kv && ple_batch && n > 1 && (pw.key_bf16 != nullptr || nkey) && ple_native_bf16_enabled();
+            const bool batched = !ple_batch_kv && ple_batch && n > 1 &&
+                                 (pw.key_bf16 != nullptr || nkey) && ple_native_bf16_enabled();
             if (ple_batch_kv) {
                 try {
                     bf16_gemv_fp32_mmvf_multi(ple_ + (size_t) tb * N, N, ss.ple.w.key_bf16,
@@ -1062,52 +1090,66 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     return false;
                 }
             } else
-            for (int t = tb; t < te; ++t) {
-                if (batched) { pw.pre_key = ple_key_ + (size_t) t * NG_HC_DIM; pw.pre_value = ple_val_ + t * N; }
-                if (!multi_write) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
-                PleOut po;
-                po.normalized = normalized;
-                po.result = Rt(t);
-                float* hist = batch_rec_ ? slot_ss(t).ple_hist : ss.ple.hist;   // the row's own history
-                try {
-                    if (ple_batch_kv) {
-                        ple_block_projected(xn_ + (size_t) t * HC * N, z_ + (size_t) t * N, Rt(t), hist,
-                                            ss.ple.w, po, ss.ple.scratch, cs);
-                    } else {
-                        ple_block(ple_ + t * N, Rt(t), hist, pw, po, ss.ple.scratch, cs);
+                for (int t = tb; t < te; ++t) {
+                    if (batched) {
+                        pw.pre_key = ple_key_ + (size_t)t * NG_HC_DIM;
+                        pw.pre_value = ple_val_ + t * N;
                     }
-                    ple_history_advance(hist, normalized, cs);
-                } catch (const std::exception& e) {
-                    err = std::string("verify PLE: ") + e.what();
-                    return false;
+                    if (!multi_write) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
+                    PleOut po;
+                    po.normalized = normalized;
+                    po.result = Rt(t);
+                    float *hist = batch_rec_ ? slot_ss(t).ple_hist : ss.ple.hist; // the row's own history
+                    try {
+                        if (ple_batch_kv) {
+                            ple_block_projected(xn_ + (size_t)t * HC * N, z_ + (size_t)t * N, Rt(t), hist, ss.ple.w, po,
+                                                ss.ple.scratch, cs);
+                        } else {
+                            ple_block(ple_ + t * N, Rt(t), hist, pw, po, ss.ple.scratch, cs);
+                        }
+                        ple_history_advance(hist, normalized, cs);
+                    } catch (const std::exception &e) {
+                        err = std::string("verify PLE: ") + e.what();
+                        return false;
+                    }
+                    copy_from_mapped(hist_snap_ + (size_t)t * HS, hist, HS, cs);
                 }
-                copy_from_mapped(hist_snap_ + (size_t) t * HS, hist, HS, cs);
-            }
             pending = false;
         }
-        auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
+        auto gr_read_group = [&](int half, bool apply, float *inj_prev, float *inj_out, bool q8_output = true) {
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = tb; t < te; ++t) {
-                FusedGrArgs& a = fa[t - tb];
-                a.R = Rt(t); a.R_out = Rt(t); a.apply = apply;
-                a.bo_prev = bo_ + t * N; a.inj_prev = inj_prev + t * HC;
-                a.w_norm = (const float*) wn[half]->data; a.w_down = (const uint16_t*) wd[half]->data;
-                a.w_up = (const uint16_t*) wu[half]->data; a.w_inject = (const uint16_t*) wi[half]->data;
-                a.q8_down = (const uint8_t*) wd[half]->hc_q8; a.q8_up = (const uint8_t*) wu[half]->hc_q8;
-                a.q8_inject = (const uint8_t*) wi[half]->hc_q8;
-                a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
-                a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
-                if (qcnt_ != nullptr) {   // S26 STRATA_QFUSE: the consumer's q8_1 image written by the read itself
+                FusedGrArgs &a = fa[t - tb];
+                a.R = Rt(t);
+                a.R_out = Rt(t);
+                a.apply = apply;
+                a.bo_prev = bo_ + t * N;
+                a.inj_prev = inj_prev + t * HC;
+                a.w_norm = (const float *)wn[half]->data;
+                a.w_down = (const uint16_t *)wd[half]->data;
+                a.w_up = (const uint16_t *)wu[half]->data;
+                a.w_inject = (const uint16_t *)wi[half]->data;
+                a.q8_down = (const uint8_t *)wd[half]->hc_q8;
+                a.q8_up = (const uint8_t *)wu[half]->hc_q8;
+                a.q8_inject = (const uint8_t *)wi[half]->hc_q8;
+                a.eps = EPS;
+                a.lo = lo_ + t * g.hc_lr;
+                a.rs = rs_ + t * HC;
+                a.inject_out = inj_out + t * HC;
+                a.mixed = mixed_ + t * N;
+                if (q8_output && qcnt_ != nullptr) { // The optional q8 image is independent of the residual fold.
                     a.q8_cnt = qcnt_;
-                    if (half == 0) a.q8_mixed = xq_ + (size_t) (t - tb) * (N / 32) * 36;
-                    else if (strata::kernels::cpu::expert_layout().native) a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
+                    if (half == 0) a.q8_mixed = xq_ + (size_t)(t - tb) * (N / 32) * 36;
+                    else if (strata::kernels::cpu::expert_layout().native)
+                        a.q8_mixed = nat_xq_ + (size_t)t * (N / 32) * 36;
                 }
             }
-            return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
-                                (int) (l * kProfPer + (half == 0 ? 27 : 30)));
+            return fused_gr_read_multi(fa, n, xn_ + (size_t)tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
+                                       (int)(l * kProfPer + (half == 0 ? 27 : 30)));
         };
-        const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
-        {   // measurement only: STRATA_DUMMY_NODES=k adds k empty kernel nodes per layer (what one node costs in a window)
+        const bool q8_attn = gr_read_group(0, pending, inj2_, inj_); // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
+        { // measurement only: STRATA_DUMMY_NODES=k adds k empty kernel nodes per layer (what one node costs in a
+          // window)
             static const int dummy = [] { const char* e = std::getenv("STRATA_DUMMY_NODES"); return e != nullptr ? std::atoi(e) : 0; }();
             for (int d = 0; d < dummy; ++d) gpu_noop(cs);
         }
@@ -1130,7 +1172,73 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         try {
-            if (!is_qsa_layer(g, l)) {
+            if (!is_qsa_layer(g, l) && tp5_gdn_ != nullptr && tp5_gdn_->valid()) {
+                // ======================= GDN (the TP5 tier) =======================
+                // 06 §4.2.3: the mixer's arithmetic (the channel-gathered qkv
+                // projection, conv, a/b, gate, the recurrence, the out projection)
+                // is the five ranks' partial, but the ENGINE-side conv and state
+                // advance stays in the graph: the drafter (its own graph, GPU0)
+                // reads the engine's own GDN state.  Order: publish x and ring
+                // FIRST, then the engine-side qkv/conv/ab/gate (the drafter's own
+                // reads), then wait flagG and copy.
+                const int tb = tb_[grp], te = te_[grp], n = te - tb;
+                uint32_t gring = 0;
+                for (int64_t m = lb_; m < l; ++m) gring += !is_qsa_layer(g, m) ? 1u : 0u;
+                gring = gring * (uint32_t)G + (uint32_t)grp + 1u;
+                doorbell_publish(mixed_ + (size_t)tb * N, nullptr, nullptr, (int64_t)n * N, 0, m_gx_ + (size_t)tb * N,
+                                 nullptr, nullptr, m_seqG_, cs);
+
+                const WeightRef* wout = need(v, "ssm_out.weight", err);
+                if (!wout || !native_of(wout, v.name("ssm_out.weight"), err)) return false;
+                // the ENGINE's own qkv projection + conv + a/b + gate (the drafter's
+                // reads: without these the drafter's next window reads a stale state)
+                const int64_t gi = gdn_idx[(size_t) l];
+                const WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
+                                *wa = need(v, "ssm_alpha.weight", err), *wb = need(v, "ssm_beta.weight", err),
+                                *wc = need(v, "ssm_conv1d.weight", err), *wnm = need(v, "ssm_norm.weight", err),
+                                *wdt = need(v, "ssm_dt.bias", err), *wsa = need(v, "ssm_a", err);
+                if (!wqkv || !wg || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
+                if (!native_of(wqkv, v.name("attn_qkv.weight"), err) || !native_of(wg, v.name("attn_gate.weight"), err))
+                    return false;
+                float* state = ss.gdn_state + (size_t) (gi - ss.gdn_ord0) * gdn_floats;
+                float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                float* qkv = qkv_L_ + (size_t) gi * MT * C;
+                float* hb = h_L_ + (size_t) gi * MT * C;
+                float* gate = gate_L_ + (size_t) gi * MT * HV;
+                float* beta = beta_L_ + (size_t) gi * MT * HV;
+                if (!q8_attn) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
+                // the engine's own conv: for a ONE-TOKEN window this also advances
+                // the history (the self-commit contract - no commit graph for T=1)
+                gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb,
+                                  self_commit);
+                gdn_ab_multi(mixed_ + (size_t) tb * N, (const uint16_t*) wa->data, (const uint16_t*) wb->data,
+                             (const float*) wdt->data, (const float*) wsa->data, gate + (size_t) tb * HV,
+                             beta + (size_t) tb * HV, (int) N, (int) HV, n, cs);
+                mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                // the engine's own recurrence runs for the prompt read (head sampling
+                // off: the tier is not synced yet) and for a one-token window (it
+                // self-commits; no commit graph for T=1).  A decode window then
+                // overwrites the rows with the tier's gathered y.
+                if (self_commit || !head_sampling_)
+                    gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_,
+                                        (int) HK, (int) HV, te, self_commit ? one_ : nullptr, cs, tb, nullptr);
+                {
+                    // the tier's gathered y (the full value dim): quantize + project
+                    // HERE, in the graph - the engine's own bit path.  The split's
+                    // per-rank requantisation error (~1e-3) accumulated in the
+                    // recurrence state (s = g*s + sk*delta) and degenerated the text;
+                    // the gather makes the out projection bitwise the engine's.
+                    wait_flag_ge(m_flagG_, gring, cs);
+                    copy_if_mode_from_mapped(y_ + (size_t) tb * ZV, m_gout_ + (size_t) tb * ZV, m_gmode_,
+                                             (int64_t) n * ZV, cs);
+                }
+                native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
+                // the out projection stays on the ENGINE in both modes (GPU0, the
+                // full-value quantization bit path) - never on the ranks.
+                mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+                stamp(l, 6, grp);
+            } else if (!is_qsa_layer(g, l)) {
                 // ======================= GDN =======================
                 const WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
                                 *wout = need(v, "ssm_out.weight", err), *wa = need(v, "ssm_alpha.weight", err),
@@ -1172,27 +1280,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                           hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0);
                     }
                 } else
-                // a one-token window keeps its token: it advances the conv history and the state itself (commit)
-                if (fuse_ab)   // 143-amdk: the conv and the a/b projections in one launch
-                    gdn_conv_ab_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, tb, self_commit,
-                                      xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
-                                      (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
-                                      (int) HV, cs);
-                else
-                gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb,
-                                  self_commit);
+                    // a one-token window keeps its token: it advances the conv history and the state itself (commit)
+                    if (fuse_ab) // 143-amdk: the conv and the a/b projections in one launch
+                        gdn_conv_ab_multi(conv, qkv, (const float *)wc->data, hb, (int)C, (int)(2 * HK), EPS, n, tb,
+                                          self_commit, xm, (const uint16_t *)wa->data, (const uint16_t *)wb->data,
+                                          (const float *)wdt->data, (const float *)wsa->data, gate + (size_t)tb * HV,
+                                          beta + (size_t)tb * HV, (int)N, (int)HV, cs);
+                    else
+                        gdn_conv_l2_multi(conv, qkv, (const float *)wc->data, hb, (int)C, (int)(2 * HK), EPS, n, cs, tb,
+                                          self_commit);
                 stamp(l, 3, grp);
                 if (br) {   // gate, beta and z, before the recurrence reads them
                     join(0);
                     join(1);
                 } else {
-                if (!fuse_ab)
-                gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
-                             (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
-                             n, cs);
-                stamp(l, 4, grp);
-                mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
-                stamp(l, 5, grp);
+                    if (!fuse_ab)
+                        gdn_ab_multi(xm, (const uint16_t *)wa->data, (const uint16_t *)wb->data,
+                                     (const float *)wdt->data, (const float *)wsa->data, gate + (size_t)tb * HV,
+                                     beta + (size_t)tb * HV, (int)N, (int)HV, n, cs);
+                    stamp(l, 4, grp);
+                    mm(wg, z_ + (size_t)tb * ZV, (int)N, (int)ZV);
+                    stamp(l, 5, grp);
                 }
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
                 if (batch_rec_) {   // each slot's recurrence over its own proposed-token group
@@ -1207,14 +1315,107 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                             (int) HK, (int) HV, t - first, nullptr, cs, 0);
                     }
                 } else
-                gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
-                                    (int) HV, te, self_commit ? one_ : nullptr, cs, tb, g_qfuse() ? (void*) xq_ : nullptr);
+                    gdn_step_norm_multi(state, hb, (int)C, gate, beta, z_, (const float *)wnm->data, EPS, y_, (int)HK,
+                                        (int)HV, te, self_commit ? one_ : nullptr, cs, tb,
+                                        g_qfuse() ? (void *)xq_ : nullptr);
                 stamp(l, 6, grp);
                 // STRATA_QFUSE: done above by gdn_step_norm_multi - but a batch's per-slot recurrence passes it no q8_1
                 // destination (#1139: the out-projection read stale bytes), so that case quantizes here as without it
                 if (!g_qfuse() || batch_rec_) native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
                 il_ready = false;
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+            } else if (qsa_tier_on) {
+                // ======================= QSA (the TP5 tier) =======================
+                // 06 §4.2.3: the mixer's arithmetic (q/indexer/attention/out) is the
+                // five ranks' partial, but the K/V APPEND stays in the graph: the
+                // drafter (its own graph, GPU0) reads the pool the verify window's
+                // rows live in, so the pool must keep receiving them - the ranks keep
+                // their own single-head pools for their attention (the same quantised
+                // cells; both appends run the same kernels on the same kcur/vcur).
+                // Order: publish x and ring FIRST (the ranks start while GPU0 runs the
+                // k/v projection), then the append, then the wait and the copy.
+                const int tb = tb_[grp], te = te_[grp], n = te - tb;
+                // Mixer doorbells count calls, including both groups of a split
+                // window, independently of the FFN doorbell's m_seq_.
+                uint32_t qring = 0;
+                for (int64_t m = lb_; m < l; ++m) qring += is_qsa_layer(g, m) ? 1u : 0u;
+                qring = qring * (uint32_t)G + (uint32_t)grp + 1u;
+                doorbell_publish(mixed_ + (size_t)tb * N, nullptr, nullptr, (int64_t)n * N, 0, m_qx_ + (size_t)tb * N,
+                                 nullptr, nullptr, m_seqQ_, cs);
+                // the K/V projection + norm/rope + the append into the ENGINE's pool
+                // (the drafter's own reads): the unsplit path's own sequence
+                const int64_t qi = qsa_idx[(size_t) l];
+                const QsaState& st = ss.qsa_states[qi];
+                const WeightRef* wk = need(v, "attn_k.weight", err);
+                const WeightRef* wv = need(v, "attn_v.weight", err);
+                const WeightRef* wkn = need(v, "attn_k_norm.weight", err);
+                if (!wk || !wv || !wkn) return false;
+                if (!native_of(wk, v.name("attn_k.weight"), err) || !native_of(wv, v.name("attn_v.weight"), err))
+                    return false;
+                if (!q8_attn) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                for (int t = tb; t < te; ++t) {   // token by token (the tier's own window is small)
+                    if (native_qsa_enabled())
+                        native_qsa_rms_norm_weighted(kcur_ + t * NKV * HD, (const float*) wkn->data,
+                                                     kcur_ + t * NKV * HD, (int) HD, (int) NKV, EPS, cs);
+                    else
+                        rms_norm_weighted(kcur_ + t * NKV * HD, (const float*) wkn->data, (int) NKV, (int) HD, EPS, cs);
+                    if (native_rope_enabled())
+                        native_rope_apply(kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, (int) NKV, (int) HD,
+                                          (int) s.n_rot, rope_scaling(), pos_ + t * NH, cs);
+                    else
+                        rope_neox_apply(kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, (int) NKV, (int) HD,
+                                        (int) s.n_rot, st.cos_tab, st.sin_tab, pos_ + t * NH, cs);
+                }
+                if (st.kv_rot) {
+                    fwht256_inplace_cuda(kcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
+                    fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
+                } else if (st.kv_hybrid) {
+                    fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
+                }
+                {   // the window's cells, token by token as the unsplit path's own
+                    for (int t = tb; t < te; ++t)
+                        kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table,
+                                          step_ + t * kStepCount, kcur_ + t * NKV * HD, vcur_ + t * NKV * HD,
+                                          s, cs, nullptr);
+                }
+                // the indexer's own append into the ENGINE's idx state (the drafter's
+                // selection reads it: without this the drafter's topk runs against a
+                // stale mirror): the raw key projection + the steps append
+                {
+                    const WeightRef* wik = need(v, "indexer.k_proj.weight", err);
+                    const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
+                    if (!wik || !wikn) return false;
+                    float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
+                    for (int t = tb; t < te; ++t)
+                        bf16_gemv_fp32_mmvf(mixed_ + (size_t) t * N, (const uint16_t*) wik->data,
+                                            idx_raw + (size_t) t * ID, (int) N, (int) ID, cs);
+                    if (batch_rec_) {   // snapshot each slot's indexer tail before its first proposed row
+                        for (int t = tb; t < te; ++t)
+                            if (t == tb || brow_[t] != brow_[t - 1])
+                                copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS,
+                                                 slot_ss(t).qsa_states[qi].idx_tail, TS, cs);
+                    } else if (grp == 0)
+                        copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
+                    if (!g_no_batch_kv) {
+                        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                        native_qsa_indexer_append_steps(idx_raw + (size_t) tb * ID,
+                                                        step_ + (size_t) tb * kStepCount + kStepPos, kStepCount,
+                                                        n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                        rope_scaling(), cs);
+                    } else {
+                        for (int t = tb; t < te; ++t) {
+                            const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                            native_qsa_indexer_append(idx_raw + (size_t) t * ID, step_ + t * kStepCount + kStepPos, 0,
+                                                      (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                      rope_scaling(), cs);
+                        }
+                    }
+                }
+                wait_flag_ge(m_flagQ_, qring, cs);
+                copy_from_mapped(bo_ + (size_t) tb * N, m_qout_ + (size_t) tb * N, (int64_t) n * N, cs);
+                stamp(l, 16, grp);
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -1267,20 +1468,36 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     copy_rows_strided(qcur_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, (int64_t) n * NH, HD, 2 * HD,
                                       df_side_[0]);
                     norm_rope_on(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH, df_side_[0]);
-                    if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, df_side_[0]);   // <Hq, Hk> = <q, k>
+                    if (st.kv_rot)
+                        fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t)n * NH, df_side_[0]); // <Hq, Hk> = <q, k>
                     fork(1);
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
                                               IQ * ID, N, IQ * ID, n, df_side_[1]);
                     norm_rope_on(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, df_side_[1]);
                 }
-                if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
-                else for (int t = tb; t < te; ++t)
-                    bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
+                if (qb)
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t *)wik->data, idx_raw + tb * ID, ID, N,
+                                              ID, n, cs);
+                else
+                    for (int t = tb; t < te; ++t)
+                        bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t *)wik->data, idx_raw + t * ID, (int)N,
+                                            (int)ID, cs);
                 stamp(l, 7, grp);
                 mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                 mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
-                if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
-                else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
+                for (int t = tb; t < te; ++t) {   // token by token (the tier's own window is small)
+                    if (native_qsa_enabled())
+                        native_qsa_rms_norm_weighted(kcur_ + t * NKV * HD, (const float*) wkn->data,
+                                                     kcur_ + t * NKV * HD, (int) HD, (int) NKV, EPS, cs);
+                    else
+                        rms_norm_weighted(kcur_ + t * NKV * HD, (const float*) wkn->data, (int) NKV, (int) HD, EPS, cs);
+                    if (native_rope_enabled())
+                        native_rope_apply(kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, (int) NKV, (int) HD,
+                                          (int) s.n_rot, rope_scaling(), pos_ + t * NH, cs);
+                    else
+                        rope_neox_apply(kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, (int) NKV, (int) HD,
+                                        (int) s.n_rot, st.cos_tab, st.sin_tab, pos_ + t * NH, cs);
+                }
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
                     fwht256_inplace_cuda(kcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
                     fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
@@ -1322,26 +1539,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                             kv_append_step(st.k_pool, st.v_pool, st.page_table, step_ + t * kStepCount,
                                            kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
                 } else
-                for (int t = tb; t < te; ++t) {
-                    const QsaState& st = slot_ss(t).qsa_states[qi];   // the row's own K/V (ss's outside a batch)
-                    const int32_t* step_t = step_ + t * kStepCount;
-                    if (st.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
-                        const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
-                        const bool mirror = st.host.present();   // streamed: the host copy too
-                        kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
-                                          kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs, mirror ? &hk : nullptr);
-                        kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
-                                          vcur_ + t * NKV * HD, s, cs, mirror ? &hv : nullptr);
-                    } else if (st.kv_q4)
-                        kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
-                                          vcur_ + t * NKV * HD, s, cs, &st.host);
-                    else if (st.kv_int8)
-                        kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
-                                          kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
-                    else
-                        kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
-                                       vcur_ + t * NKV * HD, s, cs, &st.host);
-                }
+                    for (int t = tb; t < te; ++t) {
+                        const QsaState &st = slot_ss(t).qsa_states[qi]; // the row's own K/V (ss's outside a batch)
+                        const int32_t *step_t = step_ + t * kStepCount;
+                        if (st.kv_hybrid) { // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
+                            const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
+                            const bool mirror = st.host.present(); // streamed: the host copy too
+                            kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
+                                              kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs,
+                                              mirror ? &hk : nullptr);
+                            kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
+                                              vcur_ + t * NKV * HD, s, cs, mirror ? &hv : nullptr);
+                        } else if (st.kv_q4)
+                            kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
+                                              vcur_ + t * NKV * HD, s, cs, &st.host);
+                        else if (st.kv_int8)
+                            kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
+                                              kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
+                        else
+                            kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
+                                           vcur_ + t * NKV * HD, s, cs, &st.host);
+                    }
                 if (dec_batch && !g_no_batch_kv && !batch_rec_) {
                     const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                     native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
@@ -1360,43 +1578,48 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (qbr) {
                     join(1);   // the indexer query, for the block scores
                 } else {
-                mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
-                if (qb) {
-                    if (fuse_nr) {   // the q/gate split reads q straight out of the q|gate rows (stride 2 * HD)
-                        native_qsa_rms_norm_rope(qfull_ + tb * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data,
-                                                 qcur_ + tb * NH * HD, (int) (n * NH), (int) HD, (int) s.n_rot, EPS,
-                                                 rope_scaling(), pos_ + tb * NH, cs);
+                    mm(wq, qfull_ + tb * NH * 2 * HD, (int)N, (int)(NH * 2 * HD));
+                    if (qb) {
+                        if (fuse_nr) { // the q/gate split reads q straight out of the q|gate rows (stride 2 * HD)
+                            native_qsa_rms_norm_rope(qfull_ + tb * NH * 2 * HD, (int)(2 * HD), (const float *)wqn->data,
+                                                     qcur_ + tb * NH * HD, (int)(n * NH), (int)HD, (int)s.n_rot, EPS,
+                                                     rope_scaling(), pos_ + tb * NH, cs);
+                        } else {
+                            // the q/gate split as a copy kernel: the window's chain stays kernel to kernel (PDL)
+                            copy_rows_strided(qcur_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, (int64_t)n * NH, HD,
+                                              2 * HD, cs);
+                            norm_rope(qcur_ + tb * NH * HD, wqn, (int)(n * NH), (int)HD, pos_ + tb * NH);
+                        }
+                        if (st.kv_rot)
+                            fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t)n * NH, cs); // <Hq, Hk> = <q, k>
+                        bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t *)wiq->data, qidx_ + tb * IQ * ID,
+                                                  IQ * ID, N, IQ * ID, n, cs);
+                        norm_rope(qidx_ + tb * IQ * ID, wiqn, (int)(n * IQ), (int)ID, pos_i + tb * IQ);
                     } else {
-                    // the q/gate split as a copy kernel: the window's chain stays kernel to kernel (PDL)
-                    copy_rows_strided(qcur_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, (int64_t) n * NH, HD, 2 * HD, cs);
-                    norm_rope(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH);
+                        for (int t = tb; t < te; ++t) {
+                            float *qc = qcur_ + t * NH * HD;
+                            if (fuse_nr) {
+                                native_qsa_rms_norm_rope(qfull_ + t * NH * 2 * HD, (int)(2 * HD),
+                                                         (const float *)wqn->data, qc, (int)NH, (int)HD, (int)s.n_rot,
+                                                         EPS, rope_scaling(), pos_ + t * NH, cs);
+                            } else {
+                                if (cudaMemcpy2DAsync(qc, (size_t)HD * 4, qfull_ + t * NH * 2 * HD, (size_t)HD * 2 * 4,
+                                                      (size_t)HD * 4, (size_t)NH, cudaMemcpyDeviceToDevice,
+                                                      cs) != cudaSuccess) {
+                                    err = "verify: the q/gate split failed";
+                                    return false;
+                                }
+                                norm_rope(qc, wqn, (int)NH, (int)HD, pos_ + t * NH);
+                            }
+                            if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs); // <Hq, Hk> = <q, k>
+                        }
+                        for (int t = tb; t < te; ++t) {
+                            float *qx = qidx_ + t * IQ * ID;
+                            bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t *)wiq->data, qx, (int)N, (int)(IQ * ID),
+                                                cs);
+                            norm_rope(qx, wiqn, (int)IQ, (int)ID, pos_ + t * NH);
+                        }
                     }
-                    if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
-                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
-                                              N, IQ * ID, n, cs);
-                    norm_rope(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ);
-                } else {
-                for (int t = tb; t < te; ++t) {
-                    float* qc = qcur_ + t * NH * HD;
-                    if (fuse_nr) {
-                        native_qsa_rms_norm_rope(qfull_ + t * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data, qc,
-                                                 (int) NH, (int) HD, (int) s.n_rot, EPS, rope_scaling(), pos_ + t * NH, cs);
-                    } else {
-                    if (cudaMemcpy2DAsync(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4,
-                                          (size_t) HD * 4, (size_t) NH, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
-                        err = "verify: the q/gate split failed";
-                        return false;
-                    }
-                    norm_rope(qc, wqn, (int) NH, (int) HD, pos_ + t * NH);
-                    }
-                    if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
-                }
-                for (int t = tb; t < te; ++t) {
-                    float* qx = qidx_ + t * IQ * ID;
-                    bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qx, (int) N, (int) (IQ * ID), cs);
-                    norm_rope(qx, wiqn, (int) IQ, (int) ID, pos_ + t * NH);
-                }
-                }
                 }
                 stamp(l, 10, grp);
                 if (batch_rec_) {   // each row selects and attends over its own slot's K/V
@@ -1413,31 +1636,35 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               attn_ + t * NH * HD, 1, cs);
                     }
                 } else {
-                qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
-                                 s, scores_ + (size_t) tb * max_blocks_, cs);
-                qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
-                               sel_ + (size_t) tb * cap_, cs);
-                stamp(l, 11, grp);
-                // KV streaming: the n selections' blocks resident (device-side, inside the graph)
-                qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
-                stamp(l, 12, grp);
-                if (qbr) join(0);   // the query, for attention
-                const QsaAttnPools pools = qsa_attn_pools(st);
-                qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
-                                      s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
+                    qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n,
+                                     max_blocks_, s, scores_ + (size_t)tb * max_blocks_, cs);
+                    qsa_block_topk(scores_ + (size_t)tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
+                                   sel_ + (size_t)tb * cap_, cs);
+                    stamp(l, 11, grp);
+                    // KV streaming: the n selections' blocks resident (device-side, inside the graph)
+                    qsa_kv_resolve(st, *g_, sel_ + (size_t)tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
+                    stamp(l, 12, grp);
+                    if (qbr) join(0); // the query, for attention
+                    const QsaAttnPools pools = qsa_attn_pools(st);
+                    qsa_decode_attn_batch(
+                        qcur_ + tb * NH * HD, pools, sel_ + (size_t)tb * cap_, step_ + tb * kStepCount, cap_, s,
+                        attn_scratch_ + (size_t)tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
                 }
                 stamp(l, 13, grp);
-                if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
-                if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
-                                              (int) (n * NH), (int) HD, cs);
+                if (st.kv_rot || st.kv_hybrid)
+                    fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t)n * NH, cs); // back: H^-1 = H
+                if (qb)
+                    native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
+                                          (int)(n * NH), (int)HD, cs);
                 else
-                for (int t = tb; t < te; ++t) {
-                    if (native_qsa_enabled())
-                        native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD,
-                                              (int) NH, (int) HD, cs);
-                    else
-                        qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
-                }
+                    for (int t = tb; t < te; ++t) {
+                        if (native_qsa_enabled())
+                            native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD,
+                                                  (int)NH, (int)HD, cs);
+                        else
+                            qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD,
+                                               cs);
+                    }
                 stamp(l, 14, grp);
                 native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
                 il_ready = false;
@@ -1448,15 +1675,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
         stamp(l, 16, grp);
-        const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
-        stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
+        const bool tp5_layer = tp5_ != nullptr && tp5_->is_tp5_layer(l);
+        const bool sh_fork =
+            sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
+        const bool qdedup = g_qdedup() && !sh_fork && strata::kernels::cpu::expert_layout().native;
+        // TP5 quantizes on its ranks. Only an explicitly deduplicated shared
+        // expert can consume GPU0's q8 image when no local routed expert runs.
+        const bool q8_ffn = gr_read_group(1, true, inj_, inj2_, !tp5_layer || qdedup);
+        stamp(l, 32, grp); // the profile only: the FFN-side read ends here, the router starts
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
         // competes with it for the GPU's first microseconds); STRATA_SH_FORK_LATE=0 forks at the top as before
         static const bool sh_fork_late_env = [] {
-            const char* e = std::getenv("STRATA_SH_FORK_LATE");
+            const char *e = std::getenv("STRATA_SH_FORK_LATE");
             return !e || e[0] != '0';
         }();
-        const bool sh_fork = sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
         const bool sh_fork_late = sh_fork && sh_fork_late_env && !ar_on();
         cudaStream_t sh_stream = sh_fork ? sh_cs_ : cs;
         if (sh_fork && !sh_fork_late) {
@@ -1477,10 +1709,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                              logits_ + tb * NE, NE, N, NE, n,
                                                              (const uint16_t*) w_sgi->data, sh_g_ + tb, 1, cs);
                 if (!sg_ready)
-                bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
-                                          NE, n, cs);
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t *)w_router->data, logits_ + tb * NE,
+                                              NE, N, NE, n, cs);
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
-            } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
+            } catch (const std::exception& e) {
+                err = "verify router: " + std::string(e.what());
+                return false;
+            }
 #if defined(STRATA_HIP_GFX906)
         } else if (dec_batch) {
             // gfx906: the Coder's 256-expert router (the native router is 512 x 10 only) for the whole window in one
@@ -1491,11 +1726,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 return false;
 #endif
         } else
-        for (int t = tb; t < te; ++t) {
-            MoEBuffers mb = ss.moe;
-            mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
-            if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
-        }
+            for (int t = tb; t < te; ++t) {
+                MoEBuffers mb = ss.moe;
+                mb.logits = logits_ + t * NE;
+                mb.ids = ids_ + t * K;
+                mb.weights = w_ + t * K;
+                if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
+            }
         // STRATA_ROUTE_PRIOR=lambda (opt-in, changes the output): the top-10 picked again with a logit bonus for the
         // resident experts; the weights stay the router's (route_prior.cu)
         static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
@@ -1507,14 +1744,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
                                       route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
                                       rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
-            } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
+            } catch (const std::exception& e) {
+                err = "verify route-resident: " + std::string(e.what());
+                return false;
+            }
         }
         if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, m_plan_err_);
         } else {
-            if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
+            if (device_plan_ && !tp5_layer)   // E-6: only local experts consume the device plan.
                 resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                               hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                               plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
@@ -1525,23 +1765,24 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                        m_ids_ + tb * K, m_w_ + tb * K, m_seq_, (uint32_t) ((l - lb_) * G + grp + 1), cs);
             else
 #endif
-            // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
-            // whatever the device's residency table says (pipelined windows)
-            if (remote_opt_ || always_publish_)
-                doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
-                                 m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
-            else {
-                const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
-                doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
-                                     m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
-            }
+                // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
+                // whatever the device's residency table says (pipelined windows).
+                // The TP5 ranks reduce with the router weights; publish them even
+                // when the local residency table would omit all CPU rows.
+                if (remote_opt_ || always_publish_ || tp5_layer)
+                    doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t)n * N, (int64_t)n * K, m_x_ + tb * N,
+                                     m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+                else {
+                    const int32_t *layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
+                    doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int)g.n_expert, (int64_t)n * N, (int64_t)n * K,
+                                         m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
+                }
             if (sh_fork_late) {
                 cudaEventRecord(ev_fork_, cs);
                 cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
             }
         }
         stamp(l, 17, grp);
-        bool qdedup = false;   // STRATA_VERIFY_QDEDUP took effect: the experts' q8_1 image of xm is already made
         {
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
                             *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
@@ -1550,24 +1791,29 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 !native_of(wsd, v.name("ffn_down_shexp.weight"), err))
                 return false;
             NativeSharedWeights nsw;
-            nsw.gate_type = wsg->native_type; nsw.gate_data = wsg->native_data;
-            nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
-            nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
+            nsw.gate_type = wsg->native_type;
+            nsw.gate_data = wsg->native_data;
+            nsw.up_type = wsu->native_type;
+            nsw.up_data = wsu->native_data;
+            nsw.down_type = wsd->native_type;
+            nsw.down_data = wsd->native_data;
             nsw.q8_1 = sh_fork ? sh_xq_ : xq_;
             // STRATA_VERIFY_QDEDUP=1 (not with the forked shared-expert stream, which quantizes into its own buffer): the
             // experts' q8_1 image of xm is made first and the shared expert's gate/up read it (quantize_q8_1_rows and
             // native_quantize_q8_1 write the same bytes)
-            qdedup = g_qdedup() && !sh_fork && strata::kernels::cpu::expert_layout().native;
             if (qdedup && !q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
             if (!shared_expert_native_bf16_enabled()) {
-                if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, sh_stream);   // contiguous rows
-                else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, sh_stream);
+                if (dec_batch)
+                    f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t)n * N, sh_stream); // contiguous rows
+                else
+                    for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, sh_stream);
             }
             try {
+                const int sh_lfuse = (sg_ready ? 1 : 0) | ((lfuse_on(n) && g_lfuse_pair()) ? 2 : 0);
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
                                     sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, sh_stream,
                                     qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr,
-                                    (sg_ready ? 1 : 0) | (lfuse_on(n) && g_lfuse_pair() ? 2 : 0));
+                                    sh_lfuse);
                 sg_gated_[grp] = sg_ready;
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();
@@ -1575,11 +1821,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             if (sh_fork) cudaEventRecord(ev_join_, sh_cs_);
         }
-        if (strata::kernels::cpu::expert_layout().native) {
-            if (!qdedup)
-                if (!q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
-        } else
-            quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
+        if (!tp5_layer) {
+            if (strata::kernels::cpu::expert_layout().native) {
+                if (!qdedup)
+                    if (!q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t)tb * (N / 32) * 36, cs);
+            } else
+                quantize_q8_0_scaled(xm, hit_xq_ + (size_t)tb * (N / 32) * 34, hit_xs_ + (size_t)tb * (N / 32),
+                                     (int64_t)n * N, cs);
+        }
         stamp(l, 18, grp);
         return true;
     };
@@ -1622,7 +1871,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         bool hits_in_combine = false;
-        if (ar_on()) {
+        const bool tp5_layer = tp5_ != nullptr && tp5_->is_tp5_layer(l);
+        if (tp5_layer) {
+            // No local hits or streamed experts: wait for the complete tier result,
+            // then let the combine read it directly instead of copying it to VRAM.
+            wait_flag_ge(m_flag_, ring, cs);
+            stamp(l, 23, grp); // waitCPU: no local hit/PCIe stages on this path
+            // Retain the pool's per-group reserved span: a later non-TP5 group
+            // may run while this group's mapped result is still being consumed.
+            parts_out = m_ymiss_ + (size_t)tb * K * N;
+        } else if (ar_on()) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
             stamp(l, 20, grp);
@@ -1684,27 +1942,39 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
-        if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
+        if (tp5_layer) {
             try {
-                native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
-            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
-        } else
-        if (hits_in_combine) {
+                tp5_->combine(parts_out, shared_ + tb * N, bo_ + tb * N, n, cs);
+            } catch (const std::exception &e) {
+                err = "verify tp5 combine: " + std::string(e.what());
+                return false;
+            }
+        } else if (sg_gated_[grp]) { // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it
+                                     // (all rows are hits)
+            try {
+                native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N,
+                                                    N, K, n, cs);
+            } catch (const std::exception &e) {
+                err = "verify combine: " + std::string(e.what());
+                return false;
+            }
+        } else if (hits_in_combine) {
             try {
                 native_moe_combine_multi_hits_added(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
                                                     shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
-        } else
-        if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
+        } else if (dec_batch && n > 1 && native_moe_combine_enabled()) { // one launch for the window's rows
             try {
-                native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+                native_moe_combine_multi(parts_out, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
-        for (int t = tb; t < te; ++t) {
-            MoEBuffers mb = ss.moe;
-            mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
-            if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
-        }
+            for (int t = tb; t < te; ++t) {
+                MoEBuffers mb = ss.moe;
+                mb.weights = w_ + t * K;
+                mb.shared = shared_ + t * N;
+                if (!moe_combine_parts(g, l, K, mb, parts_out + (size_t)(t - tb) * K * N, bo_ + t * N, cs, err))
+                    return false;
+            }
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
         stamp(l, 24, grp);
@@ -1818,6 +2088,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
+        const bool nan_guard = nan_guard_on();
         if (argmax_rows_wanted()) {   // sm_80 to sm_89: the pick over many blocks a row (bitwise the one-block kernel's)
             argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
         } else {
@@ -1827,7 +2098,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
         }
         // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
-        if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
+        if (nan_guard) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
     }
     stamp(g.n_layers, 1, 0);
     return true;
@@ -2104,6 +2375,10 @@ bool Verifier::capture_commit(std::string& err) {
                                     (int) MT);   // S26: t_out_begin = MT - the replay's outputs (y_dummy_) are never read
                 ++gdn_index;
             } else {
+                // 06 §4.2.3: with the QSA tier on, the ENGINE's own idx state still
+                // advances here (the drafter reads it); the ranks' own mirrors advance
+                // through the tier's commit, called from Verifier::commit beside this
+                // graph - so this branch runs for BOTH modes
                 const QsaState& st = ss.qsa_states[qsa_index];
                 const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
                 if (!wikn) { ok = false; break; }
@@ -2159,6 +2434,13 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (h_flagQ_ != nullptr) *(volatile uint32_t*) h_flagQ_ = 0;   // 06 §4.2.3: the QSA doorbell's wait word
+    if (h_seqQ_ != nullptr) *(volatile uint32_t*) h_seqQ_ = 0;   // and its ring
+    qsa_want_ = 0;
+    if (h_flagG_ != nullptr) *(volatile uint32_t*) h_flagG_ = 0;   // 06 §4.2.3: the GDN doorbell's own
+    if (h_gmode_ != nullptr) *(volatile uint32_t*) h_gmode_ = 1;   // the read's windows start in the engine-y mode
+    if (h_seqG_ != nullptr) *(volatile uint32_t*) h_seqG_ = 0;
+    gdn_want_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
@@ -2251,8 +2533,48 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (!capture(T, err) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
-    if (!staged_) stage_inputs(T, tokens, pos0);
+    const bool first_stage = !staged_;
+    if (first_stage) stage_inputs(T, tokens, pos0);
     staged_ = false;
+    if (tp5_gdn_ != nullptr && tp5_gdn_->valid() && !gdn_state_synced_ &&
+        gdn_sync_pending_) {
+        // 06: the read's LAST window commit may still be in flight (commit_async) -
+        // the engine's conv state it advances must land BEFORE the tier syncs from
+        // it, or the tier's conv history stays a window behind (hb off ~5x, the y
+        // off with it, the text degenerate)
+        if (!wait_commit(err)) return false;
+        const ModelGeometry& g = *g_;
+        const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                    (uint64_t) g.ssm_conv_channels * 3;
+        std::string terr;
+        // 06: the estate walks THIS STAGE's GDN layers (lb_..le_): a layer split's
+        // session owns only its own slice - the first version walked all 48 layers
+        // and read past the arena (an illegal access), the second synced layer 0
+        // into every rank layer (the missing ++).
+        int64_t gdn_index = 0;
+        for (int64_t m = 0; m < lb_; ++m) gdn_index += is_qsa_layer(g, m) ? 0 : 1;
+        // the batched span form: the per-layer form's 5 device syncs + 128 row
+        // copies PER LAYER cost 8.7 s per request on this rig (measured 2026-10-16
+        // as the whole "stage" bucket of the GDN=1 decode split) - one drain and
+        // one H2D per (layer, rank) instead.  The estate base is the arena's own
+        // layer-0 block; the tier indexes it by its OWN layer numbering.
+        if (ss.gdn_ord0 != 0 || gdn_index != 0) {   // a layer split's slice: fall back to the per-layer form
+            for (int64_t l = lb_; l < le_; ++l) {
+                if (is_qsa_layer(g, l)) continue;
+                const float* estate = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
+                if (!tp5_gdn_->sync_state(l, estate, terr)) {
+                    err = "verify tp5 gdn sync: " + terr;
+                    return false;
+                }
+                ++gdn_index;
+            }
+        } else if (!tp5_gdn_->sync_state_span(lb_, le_, ss.gdn_state, gdn_floats, terr)) {
+            err = "verify tp5 gdn sync: " + terr;
+            return false;
+        }
+        gdn_state_synced_ = true;
+        gdn_sync_pending_ = false;
+    }
     const bool do_ple = ss.ple.ready() && ple_stage();
     uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];
     if (do_ple) {
@@ -2314,50 +2636,314 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k / G;
         const int grp = (int) (k % G);
+        const bool tp5_layer = tp5_ != nullptr && tp5_->is_tp5_layer(l);
         const uint32_t want = (uint32_t) (k + 1);
         const Clock::time_point a = Clock::now();
         auto last_flush = a;
         uint32_t spins = 0;
-        progress_at("verify window: waiting for the GPU to reach layer", l);
-        while (*seq < want) {
-            _mm_pause();
-            if ((++spins & 1023u) != 0) continue;
-            const auto now = Clock::now();
-            if (now - last_flush > std::chrono::microseconds(2000)) {
-                last_flush = now;
+        auto wait_for_ffn_ring = [&]() -> bool {
+            progress_at("verify window: waiting for the GPU to reach layer", l);
+            while (*seq < want) {
+                _mm_pause();
+                if ((++spins & 1023u) != 0) continue;
+                const auto now = Clock::now();
+                if (now - last_flush > std::chrono::microseconds(2000)) {
+                    last_flush = now;
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
-                const cudaError_t q = launch.query();
+                    const cudaError_t q = launch.query();
 #else
-                const cudaError_t q = cudaStreamQuery(cs_);
+                    const cudaError_t q = cudaStreamQuery(cs_);
 #endif
-                if (q != cudaErrorNotReady && *seq < want) {
-                    trace_ev("NEVER-RANG", k, l, (int64_t) q);
-                    trace_dump(stderr);
-                    err = "verify: layer " + std::to_string(l) + " never rang (" +
-                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
+                    if (q != cudaErrorNotReady && *seq < want) {
+                        trace_ev("NEVER-RANG", k, l, (int64_t)q);
+                        trace_dump(stderr);
+                        err = "verify: layer " + std::to_string(l) + " never rang (" +
+                              (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) +
+                              ")" + released_note(release_gpu_waits(5000));
+                        return false;
+                    }
+                }
+                if (now - a > std::chrono::seconds(20)) {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+                    trace_ev("TIMEOUT", k, l, (int64_t)launch.query());
+#else
+                    trace_ev("TIMEOUT", k, l, (int64_t)cudaStreamQuery(cs_));
+#endif
+                    if (g_trace) {
+                        diag(stderr);
+                        const bool drained = release_gpu_waits(5000);
+                        trace_dump(stderr);
+                        err = "verify: timed out at layer " + std::to_string(l) + released_note(drained);
+                        return false;
+                    }
+                    err = "verify: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
                     return false;
                 }
             }
-            if (now - a > std::chrono::seconds(20)) {
-                // #267: the caller ends the engine; no spin kernel may outlive it
+            return true;
+        };
+        // 06 §4.2.3: a QSA layer's mixer segment rings FIRST (its own m_seqQ_ counter),
+        // before the layer's FFN doorbell: the five ranks run the whole mixer and the
+        // summed rows land in m_qout_ (the graph's wait flagQ + copy reads them).  The
+        // step/pos rows are the staging's own (host side).  The FFN segment below then
+        // rings as usual - one iteration serves BOTH of the layer's segments.
+        if (tp5_qsa_ != nullptr && tp5_qsa_->is_qsa_layer(l) &&
+            std::getenv("STRATA_TP5_QSA_SHADOW") == nullptr) {
+            const int qsa_tb = gtb[grp], qsa_n = gte[grp] - gtb[grp];
+            const uint32_t qwant = ++qsa_want_;   // this window's QSA segment count
+            progress_at("verify window: waiting for the QSA mixer doorbell of layer", l);
+            const auto qd = Clock::now();
+            auto qflush = qd;
+            uint32_t qspins = 0;
+            while (*(volatile const uint32_t*) h_seqQ_ < qwant) {
+                _mm_pause();
+                if ((++qspins & 1023u) != 0) continue;
+                const auto now = Clock::now();
+                if (now - qflush > std::chrono::microseconds(2000)) {
+                    qflush = now;
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
-                trace_ev("TIMEOUT", k, l, (int64_t) launch.query());
+                    const cudaError_t q = launch.query();
 #else
-                trace_ev("TIMEOUT", k, l, (int64_t) cudaStreamQuery(cs_));
+                    const cudaError_t q = cudaStreamQuery(cs_);
 #endif
-                if (g_trace) {
-                    diag(stderr);   // the words and the breadcrumbs before the release ...
-                    const bool drained = release_gpu_waits(5000);
-                    trace_dump(stderr);   // ... and after it: did the GPU move once its waits were raised?
-                    err = "verify: timed out at layer " + std::to_string(l) + released_note(drained);
+                    if (q != cudaErrorNotReady && *(volatile const uint32_t*) h_seqQ_ < qwant) {
+                        err = "verify: the QSA doorbell of layer " + std::to_string(l) + " never rang (" +
+                              (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) +
+                              ")" + released_note(release_gpu_waits(5000));
+                        return false;
+                    }
+                }
+                if (now - qd > std::chrono::seconds(20)) {
+                    err = "verify: the QSA doorbell of layer " + std::to_string(l) + " never rang" +
+                          released_note(release_gpu_waits(5000));
                     return false;
                 }
-                err = "verify: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
+            }
+            std::string terr;
+            const int64_t NH = g.n_head, NKV = g.n_head_kv, IQH = g.idx_q_heads;
+            const int32_t* pos_q_t = h_pos_;                       // [t*NH + h] per token per head: the token's own row
+            const int32_t* pos_k_t = h_pos_ + (size_t) max_t_ * NH;
+            const int32_t* pos_i_t = h_pos_ + (size_t) max_t_ * (NH + NKV);
+            std::vector<int32_t> pq{std::vector<int32_t>(size_t(qsa_n))}, pk{std::vector<int32_t>(size_t(qsa_n))},
+                pi{std::vector<int32_t>(size_t(qsa_n))};
+            for (int t = 0; t < qsa_n; ++t) {
+                pq[size_t(t)] = pos_q_t[size_t(qsa_tb + t) * NH];
+                pk[size_t(t)] = pos_k_t[size_t(qsa_tb + t) * NKV];
+                pi[size_t(t)] = pos_i_t[size_t(qsa_tb + t) * IQH];
+            }
+            if (!tp5_qsa_->run(l, h_qx_ + (size_t) qsa_tb * g.n_embd, qsa_n,
+                               h_step_ + (size_t) qsa_tb * strata::kernels::kStepCount,
+                               pq.data(), pk.data(), pi.data(),
+                               h_qout_ + (size_t) qsa_tb * g.n_embd, terr)) {
+                err = "verify tp5 qsa: " + terr;
                 return false;
             }
+            if (g_tp5_dbg) {   // 06 §5.3: the QSA tier's own cost split, per window
+                const auto& t = tp5_qsa_->timings();
+                qsa_dbg_total_ += t.total_ms;
+                qsa_dbg_ready_ += t.ready_us / 1000.0;
+                qsa_dbg_sum_ += t.sum_us / 1000.0;
+                ++qsa_dbg_runs_;
+            }
+            if (g_tp5_trace_on) {   // 06 §5.3: the QSA tier's per-rank producer spans
+                const auto& tr = tp5_qsa_->trace();
+                int slow = 0;
+                for (int r = 1; r < 5; ++r) if (tr.prod_span_ns[r] > tr.prod_span_ns[slow]) slow = r;
+                for (int r = 0; r < 5; ++r) tp5_trace_span_[1][r] += tr.prod_span_ns[r] / 1e6;
+                ++tp5_trace_runs_[1];
+                ++tp5_trace_slow_[1][slow];
+                // 06 §5.3 E_RELAY (host clock, no fold): the exposed wait is the
+                // ready-wait exit minus the FIRST rank's flag visibility; the skew
+                // (max - min ready_seen) is the straggler's extra exposure.  The
+                // GPU-fold prod_end_host_ns measured the STREAM tail (the flag lands
+                // mid-kernel, so the fold ran negative - see the 06 doc's note).
+                const double* rs_ = tr.ready_seen_ns;
+                if (rs_[0] > 0) {   // a full set: the wait loop stamped all five
+                    tp5_trace_erelay_[1] += tp5_qsa_->timings().ready_exit_host_ns -
+                        *std::min_element(rs_, rs_ + 5);
+                    tp5_trace_maxend_[1] += *std::max_element(rs_, rs_ + 5) -
+                        *std::min_element(rs_, rs_ + 5);
+                }
+            }
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            _mm_sfence();
+            *(volatile uint32_t*) h_flagQ_ = qwant;   // the graph's wait_flag_ge(m_flagQ_, qring) releases
+        }
+        // 06 §4.2.3: the GDN tier's own doorbell - the same shape as the QSA block
+        // above (its own m_seqG_ ring, the graph's GDN segment rings it before the
+        // FFN doorbell; the tier's run sums the five partials into m_gout_).
+        if (tp5_gdn_ != nullptr && tp5_gdn_->valid() && tp5_gdn_->is_gdn_layer(l)) {
+            const int gdn_tb = gtb[grp], gdn_n = gte[grp] - gtb[grp];
+            const uint32_t gwant = ++gdn_want_;
+            progress_at("verify window: waiting for the GDN mixer doorbell of layer", l);
+            const auto gd = Clock::now();
+            auto gflush = gd;
+            uint32_t gspins = 0;
+            while (*(volatile const uint32_t*) h_seqG_ < gwant) {
+                _mm_pause();
+                if ((++gspins & 1023u) != 0) continue;
+                const auto now = Clock::now();
+                if (now - gflush > std::chrono::microseconds(2000)) {
+                    gflush = now;
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+                    const cudaError_t q = launch.query();
+#else
+                    const cudaError_t q = cudaStreamQuery(cs_);
+#endif
+                    if (q != cudaErrorNotReady && *(volatile const uint32_t*) h_seqG_ < gwant) {
+                        err = "verify: the GDN doorbell of layer " + std::to_string(l) + " never rang (" +
+                              (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) +
+                              ")" + released_note(release_gpu_waits(5000));
+                        return false;
+                    }
+                }
+                if (now - gd > std::chrono::seconds(20)) {
+                    err = "verify: the GDN doorbell of layer " + std::to_string(l) + " never rang" +
+                          released_note(release_gpu_waits(5000));
+                    return false;
+                }
+            }
+            // 06 §4.2.3: the PROMPT READ's windows (read_windows: head sampling off,
+            // set_head_sampling(false)) keep the engine's own recurrence output - the
+            // tier is not synced yet (the read itself advances the engine state; the
+            // sync arms after the whole read).  The tier's chain is skipped entirely:
+            // its state and output are both discarded, and the sync rewrites them.
+            const bool gdn_prompt_read = !head_sampling_;
+            *(volatile uint32_t*) h_gmode_ = gdn_prompt_read ? 1u : 0u;
+            std::string terr;
+            // 06: h_gx_ is one window buffer.  The next GDN doorbell overwrites it.  Keep this layer's rows before run() and before that overwrite.  commit() reads this copy.  The prompt read does not replay the tier, so it stores nothing.
+            if (!gdn_prompt_read) {
+                const int64_t Nsnap = g.n_embd;
+                const size_t rows = (size_t) T * (size_t) Nsnap;
+                if (l == lb_ && grp == 0) {
+                    gdn_x_.assign((size_t) g.n_layers * rows, 0.0f);
+                    gdn_x_n_ = (int64_t) rows;
+                }
+                if (gdn_x_n_ == (int64_t) rows && l >= 0 && gdn_tb >= 0 && gdn_n > 0 &&
+                    (size_t) l * rows + (size_t) (gdn_tb + gdn_n) * (size_t) Nsnap <= gdn_x_.size())
+                    std::memcpy(gdn_x_.data() + (size_t) l * rows + (size_t) gdn_tb * (size_t) Nsnap,
+                                h_gx_ + (size_t) gdn_tb * (size_t) Nsnap, (size_t) gdn_n * (size_t) Nsnap * 4);
+            }
+            // Probe only (STRATA_TP5_GDN_XDUMP).  The window graph publishes this
+            // layer's x into h_gx_ and then projects it into qkv_L_[gi].  Later
+            // GDN layers overwrite the same h_gx_ rows, so a dump in commit sees
+            // the last layer's x, not layer 0's.  Capture here, after the ring and
+            // before run() reads h_gx_.  qkv_L_ is still the previous window's at
+            // this point (the projection is later in the same graph); that copy
+            // waits until the stream sync below.  Missing path does not fail the
+            // request.
+            if (!gdn_prompt_read && l == lb_ && T == 2 && pos0 == 30) {
+                const char* xdump = std::getenv("STRATA_TP5_GDN_XDUMP");
+                if (xdump != nullptr && xdump[0] != '\0') {
+                    const int64_t Ndump = g.n_embd;
+                    std::vector<float> xhost((size_t) T * (size_t) Ndump);
+                    std::memcpy(xhost.data(), h_gx_, xhost.size() * 4);
+                    if (FILE* f = std::fopen(xdump, "w")) {
+                        std::fprintf(f, "layer=%lld T=%d pos0=%lld N=%lld\n", (long long) l, T,
+                                     (long long) pos0, (long long) Ndump);
+                        std::fprintf(f, "engine_x n=%zu\n", xhost.size());
+                        for (float v : xhost) std::fprintf(f, " %.9g", v);
+                        std::fprintf(f, "\nx_dumped=1\n");
+                        std::fclose(f);
+                    }
+                }
+            }
+            if (gdn_prompt_read) {
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                _mm_sfence();
+            } else {
+            // the tier's rows start at the WINDOW head, not this group's: a split
+            // window (G == 2) runs the second group's recurrence over [0, te) - the
+            // engine's own segment recomputes the first group's rows the same way
+            // (the recurrence is sequence-dependent; B's y needs the state advanced
+            // through A).  Only the group's own rows of the gathered y are read.
+            const float* gdn_x = G > 1 && gdn_x_n_ == (int64_t) T * g.n_embd && l >= 0 &&
+                                         (size_t) (l + 1) * (size_t) gdn_x_n_ <= gdn_x_.size()
+                                     ? gdn_x_.data() + (size_t) l * (size_t) gdn_x_n_
+                                     : h_gx_;
+            if (!tp5_gdn_->run(l, gdn_x, gte[grp],
+                               h_gout_, terr, nullptr, 0, pos0)) {
+                err = "verify tp5 gdn: " + terr;
+                err += released_note(release_gpu_waits(5000));
+                return false;
+            }
+            // Probe only.  h_gout_ is the gathered y of THIS layer, before the
+            // graph copies it into y_ and before the next GDN layer reuses the
+            // same mapped rows.  Missing path does not fail the request.
+            if (l == lb_ && T == 2 && pos0 == 30) {
+                const char* ypath = std::getenv("STRATA_TP5_GDN_YDUMP");
+                if (ypath != nullptr && ypath[0] != '\0') {
+                    const int64_t ZVdump = 6144;
+                    const int64_t nrows = gte[grp];
+                    std::vector<float> yhost((size_t) nrows * (size_t) ZVdump);
+                    std::memcpy(yhost.data(), h_gout_, yhost.size() * 4);
+                    if (FILE* f = std::fopen(ypath, "w")) {
+                        std::fprintf(f, "layer=%lld T=%d pos0=%lld rows=%lld ZV=%lld\n", (long long) l, T,
+                                     (long long) pos0, (long long) nrows, (long long) ZVdump);
+                        std::fprintf(f, "tier_y n=%zu\n", yhost.size());
+                        for (float v : yhost) std::fprintf(f, " %.9g", v);
+                        std::fprintf(f, "\ny_dumped=1\n");
+                        std::fclose(f);
+                    }
+                }
+            }
+            }
+            if (g_tp5_dbg) {   // 06 §5.3: the GDN tier's own cost split, per window
+                const auto& t = tp5_gdn_->timings();
+                gdn_dbg_total_ += t.total_ms;
+                gdn_dbg_ready_ += t.ready_us / 1000.0;
+                gdn_dbg_sum_ += t.sum_us / 1000.0;
+                ++gdn_dbg_runs_;
+            }
+            if (g_tp5_trace_on) {   // 06 §5.3: the GDN tier's per-rank producer spans
+                const auto& tr = tp5_gdn_->trace();
+                int slow = 0;
+                for (int r = 1; r < 5; ++r) if (tr.prod_span_ns[r] > tr.prod_span_ns[slow]) slow = r;
+                for (int r = 0; r < 5; ++r) tp5_trace_span_[2][r] += tr.prod_span_ns[r] / 1e6;
+                ++tp5_trace_runs_[2];
+                ++tp5_trace_slow_[2][slow];
+                // 06 §5.3 E_RELAY (host clock, no fold): the exposed wait is the
+                // ready-wait exit minus the FIRST rank's flag visibility; the skew
+                // (max - min ready_seen) is the straggler's extra exposure.  The
+                // GPU-fold prod_end_host_ns measured the STREAM tail (the flag lands
+                // mid-kernel, so the fold ran negative - see the 06 doc's note).
+                const double* rs_ = tr.ready_seen_ns;
+                if (rs_[0] > 0) {   // a full set: the wait loop stamped all five
+                    tp5_trace_erelay_[2] += tp5_gdn_->timings().ready_exit_host_ns -
+                        *std::min_element(rs_, rs_ + 5);
+                    tp5_trace_maxend_[2] += *std::max_element(rs_, rs_ + 5) -
+                        *std::min_element(rs_, rs_ + 5);
+                }
+            }
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            _mm_sfence();
+            *(volatile uint32_t*) h_flagG_ = gwant;   // the graph's wait_flag_ge(m_flagG_, gring) releases
+            // a one-token window's state advance: the engine's segment advanced
+            // the conv itself (self-commit above) and the commit graph does not
+            // run for T=1 - the tier's own state advances HERE (after the flag, so
+            // the graph is already released and the ranks' streams are free).
+            // (a prompt-read window skips it: its state advance is discarded, the
+            // post-read sync rewrites the tier's state wholesale)
+            if (T == 1 && !gdn_prompt_read) {   // the whole window, not a split half
+                std::string cerr2;
+                if (!tp5_gdn_->commit_light(l, cerr2)) {
+                    err = "verify tp5 gdn self-commit: " + cerr2;
+                    err += released_note(release_gpu_waits(5000));
+                    return false;
+                }
+            }
+        }
+        // A mixed TP5 window must wait before either tier or local pool reads routing
+        // or reuses mapped output still consumed by the preceding tier. The doorbell
+        // fences those stores before seq advances. Non-TP5 windows retain their
+        // existing pool/graph overlap schedule.
+        if (tp5_ != nullptr) {
+            if (!wait_for_ffn_ring()) return false;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
         }
         const Clock::time_point b = Clock::now();
-        if (g_trace) trace_ev("RANG", k, l, (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+        if (g_trace)
+            trace_ev("RANG", k, l, (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
         VDBG("layer %lld rang\n", (long long) l);
         if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && l >= 0 &&
             (size_t) l < adapt_gate_->has.size() && adapt_gate_->has[(size_t) l] != 0 &&
@@ -2366,25 +2952,65 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
-        if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
-        if (pool != nullptr)
-            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
-                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        if (remote_opt_) remote_opt_->begin(h_w_ + (size_t)tb * ss.k, tb, n);
+        // The tier returns router-weighted rows, one per token. Its dedicated
+        // graph segment adds the shared expert; the ordinary pool's plan is unused.
+        if (tp5_layer) {
+            std::string terr;
+            if (!tp5_->run(l, h_x_ + (size_t)tb * g.n_embd, h_ids_ + (size_t)tb * ss.k, h_w_ + (size_t)tb * ss.k, n,
+                           ss.k, h_ymiss_ + (size_t)tb * ss.k * g.n_embd, terr)) {
+                err = "verify tp5: " + terr + released_note(release_gpu_waits(5000));
+                return false;
+            }
+            if (g_tp5_dbg) { // 06 §5.3: the tier's own cost split, per window
+                const auto &t = tp5_->timings();
+                tp5_dbg_total_ += t.total_ms;
+                tp5_dbg_ready_ += t.ready_all_us / 1000.0;
+                tp5_dbg_sum_ += t.sum_us / 1000.0;
+                tp5_dbg_launch_ += t.stage_launch_us / 1000.0;
+                ++tp5_dbg_runs_;
+            }
+            if (g_tp5_trace_on) {   // 06 §5.3: the FFN tier's per-rank producer spans
+                const auto& tr = tp5_->trace();
+                int slow = 0;
+                for (int r = 1; r < 5; ++r) if (tr.prod_span_ns[r] > tr.prod_span_ns[slow]) slow = r;
+                for (int r = 0; r < 5; ++r) tp5_trace_span_[0][r] += tr.prod_span_ns[r] / 1e6;
+                ++tp5_trace_runs_[0];
+                ++tp5_trace_slow_[0][slow];
+                // 06 §5.3 E_RELAY (host clock, no fold): the exposed wait is the
+                // ready-wait exit minus the FIRST rank's flag visibility; the skew
+                // (max - min ready_seen) is the straggler's extra exposure.  The
+                // GPU-fold prod_end_host_ns measured the STREAM tail (the flag lands
+                // mid-kernel, so the fold ran negative - see the 06 doc's note).
+                const double* rs_ = tr.ready_seen_ns;
+                if (rs_[0] > 0) {   // a full set: the wait loop stamped all five
+                    tp5_trace_erelay_[0] += tp5_->timings().ready_exit_host_ns -
+                        *std::min_element(rs_, rs_ + 5);
+                    tp5_trace_maxend_[0] += *std::max_element(rs_, rs_ + 5) -
+                        *std::min_element(rs_, rs_ + 5);
+                }
+            }
+        } else if (pool != nullptr)
+            pool(user, h_x_ + (size_t)tb * g.n_embd, h_ids_ + (size_t)tb * ss.k, n, ss.k,
+                 h_ymiss_ + (size_t)tb * ss.k * g.n_embd, l);
+        progress_at("verify window: waiting for the GPU to reach layer", l);
+        if (!wait_for_ffn_ring()) return false;
         if (remote_opt_) remote_opt_->end();
-        VDBG("layer %lld served\n", (long long) l);
-        if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", k, l,
-                              (int64_t) ms_since(b));   // aux: ms the CPU experts took
+        VDBG("layer %lld served\n", (long long)l);
+        if (g_trace)
+            trace_ev(tp5_layer || *(volatile uint32_t *)h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", k, l,
+                     (int64_t)ms_since(b)); // aux: ms the CPU experts took
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+        if (!tp5_layer && *(volatile uint32_t *)h_flagA_ != want) { // Only ordinary pool layers consume a plan.
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            *(volatile uint32_t*) h_flagA_ = want;
+            *(volatile uint32_t *)h_flagA_ = want;
             raise_flag(h_flagB_, want);
         }
         // Layer 1's pre(1, 0) copies h_ple_ -> ple_ after Layer 0's wait_flag_ge(m_flag_, 1).
@@ -2401,6 +3027,85 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (!(test_stall && k + 1 == steps)) *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
+    }
+    if (g_tp5_dbg && tp5_dbg_runs_ > 0) {
+        // 06 §5.3: this window's tier cost split - total vs the RELAY wait (ready) and
+        // the CPU sum, over the TP5 layers this window served
+        std::fprintf(stderr, "verify tp5: window %lld: %lld tier runs, total %.2f ms "
+                             "(ready %.2f [stage+launch %.2f + flag-wait %.2f] + sum %.2f + launch %.2f)\n",
+                     (long long) fl_k_, (long long) tp5_dbg_runs_, tp5_dbg_total_,
+                     tp5_dbg_ready_, tp5_dbg_launch_, tp5_dbg_ready_ - tp5_dbg_launch_, tp5_dbg_sum_,
+                     tp5_dbg_total_ - tp5_dbg_ready_ - tp5_dbg_sum_);
+        tp5_dbg_total_ = tp5_dbg_ready_ = tp5_dbg_sum_ = 0;
+        tp5_dbg_launch_ = 0;
+        tp5_dbg_runs_ = 0;
+    }
+    if (g_tp5_launch_count && tp5_ != nullptr && (tp5_->eager_runs() > 0 ||
+                                                 tp5_->graph_launches(0) > 0)) {
+        // 06 §6.3 launch proof: the per-rank graph-launch tally since open().  The
+        // eager path's runs are NOT launches - printed separately so the two modes
+        // cannot be confused.
+        std::fprintf(stderr, "verify tp5 launches: window %lld: graph launches/rank "
+                             "r0 %lld r1 %lld r2 %lld r3 %lld r4 %lld, eager runs %lld\n",
+                     (long long) fl_k_, (long long) tp5_->graph_launches(0),
+                     (long long) tp5_->graph_launches(1), (long long) tp5_->graph_launches(2),
+                     (long long) tp5_->graph_launches(3), (long long) tp5_->graph_launches(4),
+                     (long long) tp5_->eager_runs());
+    }
+    if (g_tp5_dbg && qsa_dbg_runs_ > 0) {   // 06 §4.2.3: the QSA tier's own split
+        std::fprintf(stderr, "verify tp5 qsa: window %lld: %lld mixer runs, total %.2f ms "
+                             "(ready %.2f + sum %.2f)\n",
+                     (long long) fl_k_, (long long) qsa_dbg_runs_, qsa_dbg_total_,
+                     qsa_dbg_ready_, qsa_dbg_sum_);
+        qsa_dbg_total_ = qsa_dbg_ready_ = qsa_dbg_sum_ = 0;
+        qsa_dbg_runs_ = 0;
+    }
+    if (g_tp5_dbg && gdn_dbg_runs_ > 0) {   // 06 §4.2.3: the GDN tier's own split - the
+        // tier's real per-window cost (the 2026-10-16 root-cause: the decode line's
+        // "stage" bucket was the per-request state sync amortized over the windows,
+        // 51.7 ms/window of it - NOT this tier; after sync_state_span it is 0.5 and
+        // this print holds what remains: the RELAY's ready-wait per run)
+        std::fprintf(stderr, "verify tp5 gdn: window %lld: %lld mixer runs, total %.2f ms "
+                             "(ready %.2f + gather %.2f + launch %.2f)\n",
+                     (long long) fl_k_, (long long) gdn_dbg_runs_, gdn_dbg_total_,
+                     gdn_dbg_ready_, gdn_dbg_sum_,
+                     gdn_dbg_total_ - gdn_dbg_ready_ - gdn_dbg_sum_);
+        gdn_dbg_total_ = gdn_dbg_ready_ = gdn_dbg_sum_ = 0;
+        gdn_dbg_runs_ = 0;
+    }
+    if (g_tp5_trace_on && (tp5_trace_runs_[0] + tp5_trace_runs_[1] + tp5_trace_runs_[2]) > 0) {
+        // 06 §5.3: this window's per-rank producer GPU spans (ms, accumulated over the
+        // window's tier runs) and the slowest-rank tallies - C/5 + I_TP's producer side
+        // and the max_r(producer_span) the decomposition formula needs
+        static const char* tier_name[3] = {"ffn", "qsa", "gdn"};
+        for (int t = 0; t < 3; ++t) {
+            if (tp5_trace_runs_[t] <= 0) continue;
+            std::fprintf(stderr, "verify tp5 trace %s: window %lld: %lld runs, prod ms/rank "
+                                 "r0 %.3f r1 %.3f r2 %.3f r3 %.3f r4 %.3f, slowest-rank counts "
+                                 "r0 %lld r1 %lld r2 %lld r3 %lld r4 %lld, "
+                                 "exposed-wait ms/run %.3f, skew ms/run %.3f\n",
+                         tier_name[t], (long long) windows, (long long) tp5_trace_runs_[t],
+                         tp5_trace_span_[t][0] / tp5_trace_runs_[t],
+                         tp5_trace_span_[t][1] / tp5_trace_runs_[t],
+                         tp5_trace_span_[t][2] / tp5_trace_runs_[t],
+                         tp5_trace_span_[t][3] / tp5_trace_runs_[t],
+                         tp5_trace_span_[t][4] / tp5_trace_runs_[t],
+                         (long long) tp5_trace_slow_[t][0], (long long) tp5_trace_slow_[t][1],
+                         (long long) tp5_trace_slow_[t][2], (long long) tp5_trace_slow_[t][3],
+                         (long long) tp5_trace_slow_[t][4],
+                         // exposed wait: ready-exit − min_r(ready_seen), ns → ms
+                         tp5_trace_erelay_[t] / 1e6 / tp5_trace_runs_[t],
+                         // skew: max_r(ready_seen) − min_r(ready_seen), ns → ms
+                         tp5_trace_maxend_[t] / 1e6 / tp5_trace_runs_[t]);
+        }
+        // reset ALL tiers AFTER the loop: resetting inside it wiped the later tiers'
+        // accumulated spans before their turn to print (the gdn lines read 0.000 with
+        // real stamps - the ffn tier's reset zeroed them first)
+        for (auto& row : tp5_trace_span_) { row[0] = row[1] = row[2] = row[3] = row[4] = 0; }
+        for (auto& row : tp5_trace_slow_) { row[0] = row[1] = row[2] = row[3] = row[4] = 0; }
+        for (auto& n : tp5_trace_runs_) n = 0;
+        for (auto& e : tp5_trace_erelay_) e = 0;
+        for (auto& m : tp5_trace_maxend_) m = 0;
     }
     // (#646 staged the next stage's inputs here; 0.1.39b keeps the layer split's order: each stage stages its own)
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
@@ -2420,6 +3125,73 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    // Probe only.  The doorbell saved this window's layer-0 x; the projection
+    // into qkv_L_[0] has now landed (the graph is done, commit has not started).
+    if (tp5_gdn_ != nullptr && tp5_gdn_->valid() && head_sampling_ && T == 2 && pos0 == 30 && lb_ == 0) {
+        // qkv and hb stay on the fork window.  State is dumped for every T=2
+        // window below, so the first decode window is not overwritten by pos=30.
+        const char* qpath = std::getenv("STRATA_TP5_GDN_EQDUMP");
+        if (qpath != nullptr && qpath[0] != '\0' && qkv_L_ != nullptr) {
+            const int64_t Cdump = 2 * 128 * 16 + 128 * 48;   // 10240
+            std::vector<float> qhost((size_t) T * (size_t) Cdump);
+            if (cudaMemcpy(qhost.data(), qkv_L_, qhost.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                if (FILE* f = std::fopen(qpath, "w")) {
+                    std::fprintf(f, "layer=0 T=%d pos0=%lld C=%lld\n", T, (long long) pos0, (long long) Cdump);
+                    std::fprintf(f, "engine_qkv n=%zu\n", qhost.size());
+                    for (float v : qhost) std::fprintf(f, " %.9g", v);
+                    std::fprintf(f, "\neq_dumped=1\n");
+                    std::fclose(f);
+                }
+            }
+        }
+        // Layer 0's hb slot is qkv_L_'s sibling (gi * MT * C).  Later GDN layers
+        // write their own slots.  Same window gate.  Probe only.
+        const char* hpath = std::getenv("STRATA_TP5_GDN_EHDUMP");
+        if (hpath != nullptr && hpath[0] != '\0' && h_L_ != nullptr) {
+            const int64_t Cdump = 2 * 128 * 16 + 128 * 48;
+            std::vector<float> hhost((size_t) T * (size_t) Cdump);
+            if (cudaMemcpy(hhost.data(), h_L_, hhost.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                if (FILE* f = std::fopen(hpath, "w")) {
+                    std::fprintf(f, "layer=0 T=%d pos0=%lld C=%lld\n", T, (long long) pos0, (long long) Cdump);
+                    std::fprintf(f, "engine_hb n=%zu\n", hhost.size());
+                    for (float v : hhost) std::fprintf(f, " %.9g", v);
+                    std::fprintf(f, "\neh_dumped=1\n");
+                    std::fclose(f);
+                }
+            }
+        }
+    }
+    // Every T=2 window, not only pos=30.  A per-pos file so the first decode
+    // window survives.  The first decode window is T=1, so that size is in too.
+    // Drain a pending commit first: that commit is the
+    // previous window's, and this copy is the state this window ran against.
+    if (tp5_gdn_ != nullptr && tp5_gdn_->valid() && head_sampling_ && (T == 1 || T == 2) && lb_ == 0) {
+        const char* spath = std::getenv("STRATA_TP5_GDN_SDUMP");
+        if (spath != nullptr && spath[0] != '\0' && ss_ != nullptr && ss_->gdn_state != nullptr) {
+            if (commit_pending_) {
+                cudaEventSynchronize(commit_done_);
+                commit_pending_ = false;
+            }
+            const int64_t Sst = g.ssm_state_size, Hv = g.ssm_v_heads, Cv = g.ssm_conv_channels;
+            const size_t nstate = size_t(Sst) * size_t(Hv) * size_t(Sst);
+            const size_t nconv = size_t(Cv) * 3;
+            std::vector<float> sh(nstate + nconv);
+            if (cudaMemcpy(sh.data(), ss_->gdn_state, sh.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                char spath2[768];
+                std::snprintf(spath2, sizeof(spath2), "%s.pos%lld", spath, (long long) pos0);
+                if (FILE* f = std::fopen(spath2, "w")) {
+                    std::fprintf(f, "layer=0 T=%d pos0=%lld S=%lld HV=%lld C=%lld\n", T, (long long) pos0,
+                                 (long long) Sst, (long long) Hv, (long long) Cv);
+                    std::fprintf(f, "engine_state n=%zu\n", nstate);
+                    for (size_t i = 0; i < nstate; ++i) std::fprintf(f, " %.9g", sh[i]);
+                    std::fprintf(f, "\nengine_conv n=%zu\n", nconv);
+                    for (size_t i = 0; i < nconv; ++i) std::fprintf(f, " %.9g", sh[nstate + i]);
+                    std::fprintf(f, "\ns_dumped=1\n");
+                    std::fclose(f);
+                }
+            }
+        }
+    }
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
         *(volatile uint32_t*) h_plan_err_ = 0;
         err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";
@@ -2652,7 +3424,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    if (last_t_ == 1 && !always_publish_ && one_token_self_commit()) {
+    if (last_t_ == 1 && !always_publish_ && !batch_rec_ && one_token_self_commit()) {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2697,6 +3469,51 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[0] = ss_->ple_prev[1];
             ss_->ple_prev[1] = last_tokens_[t];
         }
+    // 06 §4.2.3: the QSA layers' state advances on the ranks (the tier's own commit
+    // replays the indexer append for the kept prefix; the KV pool is position-addressed
+    // and already written).  The engine graph above skipped its QSA segments.
+    if (tp5_qsa_ != nullptr && tp5_qsa_->valid() && n_keep > 0) {
+        std::string terr;
+        for (int64_t l = lb_; l < le_; ++l) {
+            if (!is_qsa_layer(*g_, l)) continue;
+            // the commit's step records: ONE kStepCount row per kept token (the
+            // append_steps kernel strides pos_stride = kStepCount between rows), the
+            // pos of row t being h_commit_[2 + t] - exactly the record the engine's
+            // own commit graph replays
+            std::vector<int32_t> csteps{std::vector<int32_t>(size_t(n_keep) * strata::kernels::kStepCount)};
+            for (int64_t t = 0; t < n_keep; ++t)
+                strata::kernels::qsa_step_fill(csteps.data() + size_t(t) * strata::kernels::kStepCount,
+                                               h_commit_[2 + t], shapes_of(*g_));
+            if (!tp5_qsa_->commit(l, n_keep, tp5_qsa_->last_idx_raw(l), csteps.data(), terr)) {
+                err = "verify tp5 qsa commit: " + terr;
+                return false;
+            }
+        }
+    }
+    // 06 §4.2.3: the GDN layers' state advances on the ranks too (the tier's own
+    // commit replays the conv + the recurrence for the kept prefix from the
+    // UNTOUCHED state - the engine's own commit contract).  h_gx_ has been overwritten by later GDN layers.  The doorbell snapshot holds each layer's rows.
+    if (tp5_gdn_ != nullptr && tp5_gdn_->valid() && n_keep > 0 && head_sampling_) {   // the prompt read's commits skip: the sync rewrites
+        std::string terr;
+        const int64_t Nsnap = g_->n_embd;
+        const size_t rows = (size_t) last_t_ * (size_t) Nsnap;
+        if (gdn_x_n_ != (int64_t) rows || gdn_x_.size() < (size_t) g_->n_layers * rows) {
+            err = "verify tp5 gdn commit: the doorbell snapshot is missing";
+            return false;
+        }
+        // the tier's own commit: the conv + the recurrence replayed over the
+        // KEPT rows only (rejected drafts must not advance it) - the engine's own commit contract.  x is the doorbell snapshot, rows [0, n_keep).  A one-token window
+        // already advanced itself (commit_light in the serve loop): the replay
+        // over its single kept row is the same advance - harmless, but skipped
+        // for the cost.
+        if (!(n_keep == 1 && last_t_ == 1)) {   // a window property, not per-layer
+            if (!tp5_gdn_->commit_span(lb_, le_, n_keep, gdn_x_.data(), rows, terr, last_pos0_)) {
+                err = "verify tp5 gdn commit: " + terr;
+                err += released_note(release_gpu_waits(5000));
+                return false;
+            }
+        }
+    }
     ms_commit += ms_since(t0);
     return next_ == nullptr || next_->commit(n_keep, err);
 }
@@ -2999,6 +3816,13 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (h_flagQ_ != nullptr) *(volatile uint32_t*) h_flagQ_ = 0;   // 06 §4.2.3: the QSA doorbell's wait word
+    if (h_seqQ_ != nullptr) *(volatile uint32_t*) h_seqQ_ = 0;   // and its ring
+    qsa_want_ = 0;
+    if (h_flagG_ != nullptr) *(volatile uint32_t*) h_flagG_ = 0;   // 06 §4.2.3: the GDN doorbell's own
+    if (h_gmode_ != nullptr) *(volatile uint32_t*) h_gmode_ = 1;   // the read's windows start in the engine-y mode
+    if (h_seqG_ != nullptr) *(volatile uint32_t*) h_seqG_ = 0;
+    gdn_want_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = S;
     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
@@ -3054,6 +3878,12 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         progress_at("decode");
         progress_beat();
         return true;
+    }
+    if (tp5_qsa_ != nullptr && tp5_qsa_->valid()) {
+        // 06 §4.2.3: the QSA tier serves the run() window's doorbells; the batch rows
+        // path (STRATA_TP5_QSA with --batch) is not wired - refuse instead of hanging
+        err = "verify: the QSA tier does not run batch rows windows";
+        return false;
     }
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k;

@@ -296,6 +296,45 @@ void copy_rows_from_mapped_after(const uint32_t* flag, uint32_t value, float* ds
     copy_rows_from_mapped_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>(
         (float4*) dst, (const volatile float4*) src, width / 4, hit_rows, count, (const volatile uint32_t*) flag, value);
 }
+__global__ void copy_if_mode_kernel(float4* __restrict__ dst, const volatile float4* src,
+                                    const volatile uint32_t* mode, int64_t n4) {
+    if (*mode != 0) return;   // 06: the prompt read's windows keep the engine's own rows
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
+        const float4 v = const_cast<const float4*>(src)[i];
+        dst[i] = v;
+    }
+}
+
+__global__ void copy_to_mapped_kernel(float4* dst, const float4* __restrict__ src, int64_t n4) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+
+void copy_to_mapped(float* dst, const float* src, int64_t n, void* stream) {
+    if (n <= 0) return;
+    if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        std::fprintf(stderr, "copy_to_mapped: n must be a multiple of 4 and both pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    const int64_t n4 = n / 4;
+    const int blocks = (int) ((n4 + 255) / 256 < 64 ? (n4 + 255) / 256 : 64);
+    copy_to_mapped_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((float4*) dst, (const float4*) src, n4);
+    check_launch("copy_to_mapped");
+}
+
+void copy_if_mode_from_mapped(float* dst, const float* src, const uint32_t* mode, int64_t n, void* stream) {
+    if (n <= 0) return;
+    if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        std::fprintf(stderr, "copy_if_mode_from_mapped: n must be a multiple of 4 and both pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    const int64_t n4 = n / 4;
+    const int blocks = (int) ((n4 + 255) / 256 < 64 ? (n4 + 255) / 256 : 64);
+    copy_if_mode_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src,
+                                                                   (const volatile uint32_t*) mode, n4);
+    check_launch("copy_if_mode_from_mapped");
+}
+
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
     if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
@@ -311,17 +350,24 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
 __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                         const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
                                         float* w_out, uint32_t* seq) {
-    for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        ((volatile float*) x_out)[i] = x[i];
     if ((int) threadIdx.x < k) {
-        ids_out[threadIdx.x] = ids[threadIdx.x];
-        if (w_out != nullptr) w_out[threadIdx.x] = w[threadIdx.x];
+        // Mapped stores: a plain store can stay in L2 past the ring the host spins on.
+        // Volatile makes the ids/weight copy itself a system-visible store.  On gfx1030 that
+        // is not enough by itself: the host must also wait for seq before it reads them
+        // (Verifier::run, the TP5 layer).  Without that wait the next window's plan is built
+        // from the previous window's routing.
+        ((volatile int32_t*) ids_out)[threadIdx.x] = ids[threadIdx.x];
+        if (w_out != nullptr) ((volatile float*) w_out)[threadIdx.x] = w[threadIdx.x];
     }
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
+#if defined(__HIPCC__)
+        __hip_atomic_fetch_add(seq, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
         *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
-#if defined(__HIPCC__)  // #697: HIP only; on RDNA4 the volatile store alone can sit in L2 until the stream syncs
-        __threadfence_system();
 #endif
     }
 }

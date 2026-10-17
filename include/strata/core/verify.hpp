@@ -24,6 +24,9 @@
 #include <cstdio>
 
 #include "strata/core/expert_source.hpp"
+#include "strata/core/tp5_ffn.hpp"
+#include "strata/core/tp5_qsa.hpp"
+#include "strata/core/tp5_gdn.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -82,6 +85,29 @@ public:
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
+
+    /// Solo run() serves the tier's selected FFN layers instead of the CPU pool.
+    /// The doorbell publishes router weights; the tier returns one weighted row
+    /// per token. The graph waits on the layer-complete flag and adds the shared
+    /// expert directly from mapped rows, without a hit/miss plan or flag A/B.
+    /// Call before init/capture; nullptr disables. Batched/pipelined modes are unsupported.
+    void set_tp5(strata::core::Tp5FfnTier* tier) { tp5_ = tier; }
+    /// 06 §4.2.3: the QSA tier (opt-in with --tp5): the captured graph replaces its
+    /// QSA mixer segment with a doorbell (publish x, ring) + wait + copy, and the
+    /// serve loop runs the five ranks' partials through the RELAY.
+    void set_tp5_qsa(strata::core::Tp5QsaTier* tier) { tp5_qsa_ = tier; }
+    /// 06 §4.2.3: the 5-rank GDN tier (STRATA_TP5_GDN=1).  The verify graph's GDN
+    /// mixer segment becomes the doorbell wait (see the .cu).
+    /// 06 §4.2.3: the prompt read (read_windows/read_part) has finished: the engine's
+    /// GDN state is now the post-prefill truth - the tier syncs from it before its
+    /// first decode window.  Re-arms EVERY request (the serve reads in several cuts
+    /// and follow-up requests restore a checkpoint and read again): the sync fires
+    /// once per request, right before its first decode window.
+    void arm_gdn_sync() {
+        gdn_sync_pending_ = true;
+        gdn_state_synced_ = false;
+    }
+    void set_tp5_gdn(strata::core::Tp5GdnTier* tier) { tp5_gdn_ = tier; }
 
     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -317,6 +343,31 @@ public:
 
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
+    strata::core::Tp5FfnTier* tp5_ = nullptr;
+    strata::core::Tp5QsaTier* tp5_qsa_ = nullptr;
+    strata::core::Tp5GdnTier* tp5_gdn_ = nullptr;
+    // 06 §4.2.3: the QSA doorbell's mapped words (x rows out, y rows back, the flag
+    // and the QSA segment's own ring - a QSA layer rings TWICE per window: its mixer
+    // segment (this ring) and its FFN segment (the layer's own m_seq_ ring), so the
+    // two counters stay separate and the serve loop waits both in order)
+    float* h_qx_ = nullptr; float* m_qx_ = nullptr;
+    float* h_qout_ = nullptr; float* m_qout_ = nullptr;
+    uint32_t* h_flagQ_ = nullptr; uint32_t* m_flagQ_ = nullptr;
+    uint32_t* h_seqQ_ = nullptr; uint32_t* m_seqQ_ = nullptr;
+    uint32_t qsa_want_ = 0;   // the QSA segments served this window (the next ring's value)
+    // 06 §4.2.3: the GDN doorbell's words (x rows out, y rows back, the flag, the ring)
+    float* h_gx_ = nullptr; float* m_gx_ = nullptr;
+    // 06: one window buffer.  Later GDN doorbells overwrite it, so commit must not read it.
+    std::vector<float> gdn_x_;
+    int64_t gdn_x_n_ = 0;
+    float* h_gout_ = nullptr; float* m_gout_ = nullptr;
+    uint32_t* h_gmode_ = nullptr; uint32_t* m_gmode_ = nullptr;   // 06: 0 = the tier's y (decode), 1 = the engine's own (the prompt read)
+    uint32_t* h_flagG_ = nullptr; uint32_t* m_flagG_ = nullptr;
+    uint32_t* h_seqG_ = nullptr; uint32_t* m_seqG_ = nullptr;
+    uint32_t gdn_want_ = 0;   // the GDN segments served this window (the next ring's value)
+    bool gdn_state_synced_ = false;
+    bool gdn_sync_pending_ = false;   // 06: the prefill's own windows advance the engine state first; arm after   // 06 §4.2.3: the one-time post-prefill state sync
+    int tp5_layer_ = -1;
     bool capture(int T, std::string& err);
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
@@ -351,6 +402,30 @@ private:
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
+    // 06 §5.3: the tier's per-window cost split (accumulated only when the runtime
+    // flag is on; always present - a compile-time macro would change the class layout
+    // per translation unit, which is ODR UB and crashed the engine at init)
+public:
+    double tp5_dbg_launch_ = 0;   // 06 shift-6: the staging+launch split of ready
+    double tp5_dbg_total_ = 0, tp5_dbg_ready_ = 0, tp5_dbg_sum_ = 0;
+    int64_t tp5_dbg_runs_ = 0;
+    double qsa_dbg_total_ = 0, qsa_dbg_ready_ = 0, qsa_dbg_sum_ = 0;
+    int64_t qsa_dbg_runs_ = 0;
+    double gdn_dbg_total_ = 0, gdn_dbg_ready_ = 0, gdn_dbg_sum_ = 0;
+    int64_t gdn_dbg_runs_ = 0;
+    // 06 §5.3 (STRATA_TP5_TRACE=1): per-rank producer GPU spans (ns), accumulated per
+    // window, and the slowest-rank tallies (the rank with the max span of a run).
+    double tp5_trace_span_[3][5] = {};      // [tier 0=ffn 1=qsa 2=gdn][rank]
+    int64_t tp5_trace_runs_[3] = {};
+    int64_t tp5_trace_slow_[3][5] = {};     // how often each rank was the run's max
+    // 06 §5.3 E_RELAY (consumer side, per window): for every tier run, the gap between
+    // the host's ready-wait exit (t1, host clock) and max_r(producer_end_host) - the
+    // exposed communication+host time the decomposition formula needs.  The sum and
+    // the run count give the per-run mean; the tier's own sum_us is the CPU-side part
+    // after it.
+    double tp5_trace_erelay_[3] = {};       // Σ (ready_exit_host − max_r prod_end_host), ms
+    double tp5_trace_maxend_[3] = {};       // Σ max_r(producer_end_host − run t0), ms (the producer's critical-path arrival, host clock)
+private:
     void* arena_b_ = nullptr;
     int64_t last_pos_b_[8] = {};
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
